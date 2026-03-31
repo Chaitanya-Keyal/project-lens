@@ -153,18 +153,22 @@ python scripts/github_scan.py
 #    Currently uses Claude Code in headless mode; adaptable to other AI providers
 #    Resumable — picks up where it left off if interrupted
 ./scripts/run_batch_assess.sh
+
+# 4. Test coverage at each PR's initial submission and merge point
+#    Only for repos with a pytest-based test suite
+python scripts/calculate_coverage.py
 ```
 
-Step 1 is fast and free — just git operations against the local clones. Step 2 is rate-limited by the GitHub API but only needs to do a full fetch once; after that, it incrementally fetches only PRs with new activity. Step 3 is the AI analysis pass — it reads the stored PR data from the database, generates structured assessments, and writes them back. Each PR is committed individually, so progress is never lost.
+Steps 1 and 4 are fast and free — just git operations and local test runs. Step 2 is rate-limited by the GitHub API but only needs to do a full fetch once; after that, it incrementally fetches only PRs with new activity. Step 3 is the AI analysis pass — it reads the stored PR data from the database, generates structured assessments, and writes them back. Each PR is committed individually, so progress is never lost.
 
-All three steps are incremental and idempotent, so they can be run on a cron schedule to keep the index current as the project evolves.
+All four steps are incremental and idempotent, so they can be run on a cron schedule to keep the index current as the project evolves.
 
 ## What's in the database
 
 - **git_commits** — full commit history from local clones (authors, file changes, insertions/deletions)
 - **github_prs** — PR metadata, bodies, review comments, issue comments (complete API data as JSON)
 - **github_issues** — issue metadata and bodies
-- **pr_assessments** — AI-generated analysis per PR: tier, complexity, risk, narrative summary, per-participant contributions, lessons learned, outcome assessment, cross-references to related PRs/issues
+- **pr_assessments** — AI-generated analysis per PR: tier, complexity, risk, narrative summary, per-participant contributions, lessons learned, outcome assessment, cross-references to related PRs/issues, test coverage evolution from initial submission to merge
 - **ai_digests** — cached AI outputs with content hashes, so unchanged data is never re-analyzed
 - **analysis_runs** — when each scan or indexing job ran
 
@@ -176,7 +180,6 @@ Contributor roles and expertise are not manually assigned — they emerge from A
 - **Contributor profiles** — AI-generated characterizations of each contributor's activity, expertise areas, engagement trajectory, and review style, refreshed as new data is indexed.
 - **Telegram ingestion** — ingest group chat history and extract decisions, action items, and topic-level summaries.
 - **Translation completeness tracking** — parse `.po` files to track per-language translation progress over time, with both string-based and word-weighted completion metrics.
-- **Test coverage evolution** — run the test suite against key commits in each PR's lifecycle to track how coverage evolved from initial submission through review to merge.
 
 ## License
 

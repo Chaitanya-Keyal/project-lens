@@ -29,5 +29,8 @@ class PRAssessment(Base):
     outcome: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     # Structured links: [{type, target, note}]
     cross_references: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    # Test coverage at key commit points:
+    # [{commit, label, date, overall, new_code, files_untested, ...}]
+    coverage_evolution: Mapped[list | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
