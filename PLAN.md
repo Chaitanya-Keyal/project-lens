@@ -110,11 +110,21 @@ Once kdmukAI-bot is restored, we can switch to authenticated access (5,000 reque
 ## Database Schema
 
 ```
+project_config  — governance settings copied from config YAML on each scan
+                  fields: key, value (JSON)
+                  Stores merge_authorities, trust_tiers, and other governance
+                  data that consumers (PM agent) need without reading the YAML
+                  directly. YAML is the editable source; DB is the distribution
+                  mechanism.
+
 github_prs      — cached PR state (synced every 4 hours)
                   fields: repo, number, title, author, state, labels (JSON),
                   review_state, mergeable, diff_size, body,
                   created_at_gh, updated_at_gh, closed_at_gh, merged_at_gh,
-                  last_synced
+                  last_synced,
+                  ci_status (passing|failing|pending|none — from check-runs API),
+                  ci_commit_sha (HEAD commit the CI status refers to — if PR head
+                  has moved past this, the status is stale and needs re-fetch)
 
 github_issues   — cached issue state (synced every 4 hours)
                   fields: repo, number, title, author, state, labels (JSON),
@@ -124,13 +134,21 @@ github_issues   — cached issue state (synced every 4 hours)
 
 pr_assessments  — AI-generated analysis per PR
                   fields: repo, pr_number, tier (0-3),
-                  merge_target (nick|seedsigner-account|blocked),
+                  merge_target (login of merge authority from project config, or "blocked"),
                   reviews (JSON: [{user, type, date}]), tested_on_hardware,
                   complexity, risk, summary, recommendation,
                   participant_contributions (JSON — per-person tagged contributions),
                   lessons_learned (JSON — design principles/process lessons from review),
                   outcome (JSON — category, impact, whether review improved result),
-                  cross_references (JSON — links to related PRs/issues/discussions)
+                  cross_references (JSON — links to related PRs/issues/discussions),
+                  pending_actions (JSON — per-person open items, updated every scan;
+                    see PR Review State Tracking below),
+                  pending_actions_updated_at,
+                  merge_readiness (not_ready|possibly_ready|merge_ready — AI-generated;
+                    see Merge Readiness below),
+                  merge_readiness_rationale (brief explanation for the classification),
+                  reviewer_sentiment (JSON — AI-generated, see below),
+                  stale_reason (neglected|indecisive|soft_rejected|null — AI-generated)
 
                   participant_contributions structure:
                     [{github_username, role (author|reviewer_primary|reviewer_secondary|...),
@@ -284,7 +302,7 @@ The ingestion pipeline has an AI step: Claude Code cron jobs generate summaries/
 ### The Two-Layer Pattern
 
 1. **Vector search** retrieves relevant items (e.g., "find the 5 review comments most related to this PR's error handling")
-2. **Claude Code** (via cron prompt) synthesizes those items into human-readable output (e.g., "kdmukai caught a bug in the share validation logic")
+2. **Claude Code** (via cron prompt) synthesizes those items into human-readable output (e.g., "malcolm caught a bug in the validation logic")
 
 ### Integration with Existing Codebase Index
 
@@ -337,12 +355,12 @@ Each cron job invokes `claude -p "<prompt>"` with a detailed prompt that:
 
 ## Contributor Trust Tiers (for signal weighting)
 
-- **Core** (Nick, kdmukai, SeedSigner account): opinions are decisions
-- **Trusted** (jdlcdl, alvroble, Chaitanya-Keyal): reviews are meaningful signal
+- **Core** (lead maintainer, co-maintainers): opinions are decisions
+- **Trusted** (regular contributors with established track record): reviews are meaningful signal
 - **Known** (contributors with merged PRs): input worth reading
 - **New** (everyone else): welcome, not consensus
 
-Trust tiers are **manually curated** in the `persons` table and rarely change. They answer the narrow question: "whose review counts as an approval?"
+Trust tiers are **manually curated** (in the PM agent's contributor management, not in Lens) and rarely change. They answer the narrow question: "whose review counts as an approval?"
 
 ### AI-Derived Contributor Profiles
 
@@ -360,18 +378,139 @@ These profiles are AI-generated (stored in `ai_digests` with `source_type: contr
 
 The AI profiles should also **surface recommendations for trust tier changes** — bridging the gap between the dynamic activity data and the manually curated trust list:
 
-- **Promotion candidates**: a `new` or `known` contributor whose sustained, high-quality activity warrants consideration for `trusted` — e.g., "berlinxray has submitted 8 PRs in the last 3 months, 6 merged, consistently addresses review feedback, and has started reviewing others' PRs"
-- **Inactivity flags**: a `trusted` contributor whose activity has trailed off — not to revoke trust (their past contributions and knowledge remain valuable), but to note they're currently inactive so the PM agent doesn't route work to them. e.g., "jdlcdl: trusted, last activity 4 months ago — still trusted but not currently available for review assignments"
+- **Promotion candidates**: a `new` or `known` contributor whose sustained, high-quality activity warrants consideration for `trusted` — e.g., "kaylee has submitted 8 PRs in the last 3 months, 6 merged, consistently addresses review feedback, and has started reviewing others' PRs"
+- **Inactivity flags**: a `trusted` contributor whose activity has trailed off — not to revoke trust (their past contributions and knowledge remain valuable), but to note they're currently inactive so the PM agent doesn't route work to them. e.g., "jayne: trusted, last activity 4 months ago — still trusted but not currently available for review assignments"
 
 These are recommendations surfaced to the maintainers, not automatic changes. Trust tier changes remain a human decision.
+
+### Merge Authority
+
+Separate from trust tiers, the project config defines **who can merge and what kinds of PRs they handle**. This is a tiny set (1-3 people/accounts per project) and directly drives the merge readiness classification and PM agent routing.
+
+Example configuration:
+```yaml
+merge_authorities:
+  - login: lead-maintainer
+    scope: all            # handles all PRs, especially code/architecture
+    description: "Primary technical gatekeeper"
+  - login: org-account
+    scope: non-technical   # docs, translations, config, contributor-facing content
+    description: "Offloads lead maintainer for PRs that don't need deep technical review"
+```
+
+The `merge_target` field on `pr_assessments` records which merge authority the AI thinks should handle a given PR. This informs both the merge readiness classification and how the PM agent routes its suggestions — a docs PR at `merge_ready` gets surfaced to the non-technical merge authority, not to the lead maintainer.
+
+Merge authority is configured in the project config (not AI-derived) because it's a governance decision, not an activity pattern.
 
 ## Review Credit Heuristic
 
 1. **Always credit** (`w/@username`): left substantive review comments, requested changes, back-and-forth with author
 2. **Always credit**: tested locally and said so — "tested," "ACK," "confirmed on hardware," "ran this locally"
-3. **Skip**: merge-only with no review engagement (Nick's rubber stamps)
+3. **Skip**: merge-only with no review engagement (maintainer rubber stamps)
 4. **Skip**: drive-by "LGTM" or emoji reaction
 5. **Flag for decision**: brief approval after someone else did deep review
+
+---
+
+## PR Review State Tracking
+
+The core value of the PM task board is answering a per-person question: **"what do I need to do?"** The right abstraction isn't a PR-level state machine — it's a per-person list of open items on each PR they're involved in.
+
+### The Consumer's Perspective
+
+A PR with three reviewers doesn't have one state. It has multiple simultaneous conversations, and each participant has their own view:
+
+- **The author** may have 2 unaddressed code review comments from Reviewer A, but is waiting on Reviewer B and Reviewer C to respond to changes already pushed. Both sides of that tally are true at the same time.
+- **Reviewer B** may have 3 replies from the author to look at and decide whether the concerns were addressed.
+- **Reviewer C** may have approved and have nothing pending.
+
+The PM agent's job is to show each person their open items across all PRs. The data model should serve that directly.
+
+### Data Model: Pending Actions Per Person
+
+The `pending_actions` JSON field on `pr_assessments` stores open items per participant:
+
+```json
+{
+  "simon": {
+    "role": "author",
+    "open_items": 3,
+    "summary": "2 unaddressed review comments from malcolm, 1 from zoe",
+    "last_activity_at": "2026-03-29T09:10:00Z"
+  },
+  "malcolm": {
+    "role": "reviewer",
+    "open_items": 0,
+    "summary": "waiting on author to address 2 comments",
+    "last_activity_at": "2026-03-28T14:22:00Z"
+  },
+  "zoe": {
+    "role": "reviewer",
+    "open_items": 2,
+    "summary": "author pushed new commits addressing feedback; needs re-review",
+    "last_activity_at": "2026-03-27T11:00:00Z"
+  },
+  "wash": {
+    "role": "reviewer",
+    "open_items": 1,
+    "summary": "author pushed changes after review; re-review would be helpful",
+    "last_activity_at": "2026-03-27T16:00:00Z"
+  }
+}
+```
+
+Each person's entry only lists what's on *their* plate. The full picture of who's blocking whom is visible by looking at all participants together — no need to duplicate items across both sides.
+
+**CI failure adds an item to the author's list** — if CI is failing, the author has "fix CI" as an open item regardless of review state.
+
+**No-engagement PRs**: everyone has `open_items: 0` but the author's summary says "no reviewers have engaged yet." The PM agent surfaces this as a PR that needs attention from potential reviewers.
+
+### AI-Generated, Not Mechanical
+
+Pending actions are produced by the AI assessment — the same `claude -p` cron job that generates the rest of the PR assessment. There's no separate lightweight scan. The AI reads the raw review and comment data (`reviews_json`, `review_comments_json`, `issue_comments_json`) and determines:
+
+- **What's actually an open item** — distinguishing substantive concerns that need a response from nits, suggestions, and rhetorical comments. Not every review comment is an action item.
+- **Whether commits addressed feedback** — a pushed commit may silently resolve multiple comments without explicit replies in the threads.
+- **Reviewer sentiment** — some reviewers use nuanced language ("I'm slightly negative", "I'm skeptical", "not sure this is right but can't think of better"). The AI characterizes what kind of response the author actually needs: code changes vs. stronger argument vs. patience.
+- **Neglected PRs** — low/zero engagement, not controversial, just overlooked. No one chose to engage.
+- **Indecisive PRs** — active discussion but no convergence. Reviewers going back and forth without resolving direction. Sometimes reviewers look for others to build consensus but interest doesn't materialize.
+- **Soft rejected PRs** — open a long time with minimal engagement from a contributor who isn't well-known, effectively dying by neglect. The board should surface this honestly so a maintainer can provide direction or close with a kind explanation.
+
+Pending actions only need updating when the underlying PR data changes (`updated_at_gh` moves forward). A PR with no new activity keeps its existing assessment — nothing to recalculate.
+
+The `reviewer_sentiment` field stores AI-characterized sentiment per reviewer:
+```json
+[
+  {"reviewer": "malcolm", "sentiment": "skeptical", "needs": "stronger case for why this approach is needed"},
+  {"reviewer": "zoe", "sentiment": "neutral", "needs": "waiting for malcolm's concerns to be resolved"}
+]
+```
+
+This is particularly important for **student onboarding** — new contributors may not pick up on subtle review language in long PR threads. The board summarizing "lead dev is open but unconvinced — consider strengthening the case" provides genuinely helpful guidance.
+
+### CI Status
+
+The GitHub scan fetches check-run status for open PRs via the check-runs API endpoint (`GET /repos/{owner}/{repo}/commits/{ref}/check-runs`). One extra API call per open PR, but only for open PRs.
+
+States:
+- `passing` — all checks green
+- `failing` — one or more checks failed → author needs to fix
+- `pending` — checks still running
+- `none` — no CI configured for this repo
+
+CI failing adds "fix CI" to the author's pending items unconditionally.
+
+### Merge Readiness
+
+A holistic AI-generated signal for the lead maintainer: how ready is this PR to merge? This isn't a formula — it's the AI synthesizing everything it knows about the PR (complexity, risk, who reviewed, how thorough the review was, CI status, pending actions) into a rough classification.
+
+- **`not_ready`** — too early for the lead maintainer. The review process still has substantial work to do: active unresolved review threads, CI failing, no ACK from a trusted reviewer on a non-trivial PR, reviewer sentiment is negative/skeptical. Most open PRs are `not_ready` at any given time, and that's normal. e.g., "SLIP-39 feature — 18 unaddressed review comments, no re-review after author's changes."
+- **`possibly_ready`** — reviewed, tested, and ACKed by others, but the maintainer should look at it himself. The prerequisite for `possibly_ready` is that at least one reviewer has done substantive work — reviewed, tested, or ACKed — and that reviewer's trust tier matters. An ACK from a `trusted` or `core` reviewer is strong signal; an ACK from a `new` contributor or a drive-by "LGTM" doesn't move a PR out of `not_ready` on its own. Without a substantive review from someone the project trusts, it's `not_ready`. The AI's judgment here is whether the review depth is proportional to the PR's complexity and risk. A trusted reviewer ACKed a high-risk change — that's enough to put it on the maintainer's radar, but the risk warrants his own read. e.g., "Moderate refactor, kdmukai ACKed but touches crypto paths — worth a quick look."
+- **`merge_ready`** — ready to merge. Trusted reviewer(s) ACKed, CI passing, no open review threads. The maintainer can merge without reading the PR himself. Reserve `merge_ready` for PRs where the review process has clearly done its job. e.g., "Small l10n fix, ACKed by a trusted reviewer, CI green." For trivial PRs (typo fixes, minor cleanups), a single ACK from a known contributor may suffice.
+
+The classification accounts for proportionality — a one-line typo fix doesn't need the same review depth as a cryptographic feature. But the threshold for `merge_ready` is intentionally conservative: if there's meaningful doubt about whether the review was sufficient, it's `possibly_ready`, not `merge_ready`.
+
+The `merge_readiness_rationale` field gives the brief reasoning so the maintainer can see *why* at a glance without re-reading the whole PR. This is what powers the PM agent's "Good morning, would you like to start your day with an easy merge?" workflow — surface the `merge_ready` PRs first, then the `possibly_ready` PRs that might need a closer look.
 
 ---
 
@@ -411,7 +550,7 @@ steps:
 
 - SQLAlchemy models for all indexer tables
 - Project config loader (external YAML defines repos to track)
-- `seed.py` for initial persons data (kdmukai, newtonick, etc.)
+- Database initialization (tables created on first run)
 - Dedicated git clone of SeedSigner/seedsigner (managed by the indexer, separate from dev clone)
 - `scripts/index_git_history.py`: walks the local clone's git log and indexes commits, authors, file-level change stats, tags/releases
 - New DB table: `git_commits` — hash, repo, author, date, message, files_changed (JSON), insertions, deletions

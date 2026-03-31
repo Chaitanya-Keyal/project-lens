@@ -25,10 +25,18 @@ class RepoConfig:
 
 
 @dataclass
+class MergeAuthority:
+    login: str
+    scope: str  # "technical", "non-technical", "all"
+    description: str = ""
+
+
+@dataclass
 class ProjectConfig:
     name: str = "unknown"
     display_name: str = "Unknown Project"
     repos: list[RepoConfig] = field(default_factory=list)
+    merge_authorities: list[MergeAuthority] = field(default_factory=list)
 
 
 def load_project_config() -> ProjectConfig:
@@ -45,9 +53,13 @@ def load_project_config() -> ProjectConfig:
 
     project = data.get("project", {})
     repos = [RepoConfig(**r) for r in data.get("repos", [])]
+    merge_authorities = [
+        MergeAuthority(**ma) for ma in data.get("merge_authorities", [])
+    ]
 
     return ProjectConfig(
         name=project.get("name", "unknown"),
         display_name=project.get("display_name", "Unknown Project"),
         repos=repos,
+        merge_authorities=merge_authorities,
     )

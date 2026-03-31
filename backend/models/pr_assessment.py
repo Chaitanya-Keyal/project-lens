@@ -32,5 +32,15 @@ class PRAssessment(Base):
     # Test coverage at key commit points:
     # [{commit, label, date, overall, new_code, files_untested, ...}]
     coverage_evolution: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    # Per-person open items: {username: {role, open_items, summary, last_activity_at}}
+    pending_actions: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    pending_actions_updated_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # Merge readiness: not_ready|possibly_ready|merge_ready
+    merge_readiness: Mapped[str | None] = mapped_column(String, nullable=True)
+    merge_readiness_rationale: Mapped[str | None] = mapped_column(String, nullable=True)
+    # Per-reviewer sentiment: [{reviewer, sentiment, needs}]
+    reviewer_sentiment: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    # Why a PR is stale: neglected|indecisive|soft_rejected|null
+    stale_reason: Mapped[str | None] = mapped_column(String, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())

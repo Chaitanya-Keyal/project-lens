@@ -27,7 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from backend.config import settings
 from backend.database import engine, async_session
-from backend.models import Base, GithubPR, GithubIssue, AnalysisRun
+from backend.models import Base, GithubPR, GithubIssue, AnalysisRun, ProjectConfigEntry
 from backend.project_config import load_project_config
 
 GITHUB_API = "https://api.github.com"
@@ -335,6 +335,26 @@ async def main():
     # Ensure tables exist
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+
+    # Sync governance config from YAML to DB
+    async with async_session() as session:
+        config_entries = {
+            "merge_authorities": [
+                {"login": ma.login, "scope": ma.scope, "description": ma.description}
+                for ma in config.merge_authorities
+            ],
+        }
+        for key, value in config_entries.items():
+            result = await session.execute(
+                select(ProjectConfigEntry).where(ProjectConfigEntry.key == key)
+            )
+            existing = result.scalar_one_or_none()
+            if existing:
+                existing.value = value
+                existing.updated_at = datetime.now(timezone.utc)
+            else:
+                session.add(ProjectConfigEntry(key=key, value=value))
+        await session.commit()
 
     run_start = datetime.now(timezone.utc)
     limiter = RateLimiter()

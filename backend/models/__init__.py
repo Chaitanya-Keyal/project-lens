@@ -10,6 +10,7 @@ from backend.models.api_usage import APIUsage
 from backend.models.ai_digest import AIDigest
 from backend.models.git_commit import GitCommit
 from backend.models.analysis_run import AnalysisRun
+from backend.models.project_config_entry import ProjectConfigEntry
 
 __all__ = [
     "Base",
@@ -24,4 +25,5 @@ __all__ = [
     "AIDigest",
     "APIUsage",
     "AnalysisRun",
+    "ProjectConfigEntry",
 ]

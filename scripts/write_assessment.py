@@ -52,6 +52,12 @@ async def write_assessment(data: dict):
             "lessons_learned": data.get("lessons_learned"),
             "outcome": data.get("outcome"),
             "cross_references": data.get("cross_references"),
+            "pending_actions": data.get("pending_actions"),
+            "pending_actions_updated_at": now if data.get("pending_actions") else None,
+            "merge_readiness": data.get("merge_readiness"),
+            "merge_readiness_rationale": data.get("merge_readiness_rationale"),
+            "reviewer_sentiment": data.get("reviewer_sentiment"),
+            "stale_reason": data.get("stale_reason"),
         }
 
         if existing:
