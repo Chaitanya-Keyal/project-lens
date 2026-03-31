@@ -128,12 +128,22 @@ project:
   name: myproject
   display_name: My Project
 
+merge_authorities:
+  - login: lead-maintainer
+    scope: technical
+    description: "Primary technical gatekeeper for code PRs"
+  - login: org-account
+    scope: non-technical
+    description: "Handles docs, translations, config PRs"
+
 repos:
   - owner: myorg
     name: main-repo
   - owner: myorg
     name: other-repo
 ```
+
+`merge_authorities` defines who can merge PRs and what kinds they handle. This drives the AI's merge readiness classification — it needs to know who the gatekeepers are and what scope each covers. The config is synced to the database on each scan so downstream consumers (dashboards, chatbots) can read it without accessing the YAML directly.
 
 Set `GITHUB_TOKEN` in `.env` for authenticated API access (5,000 req/hr vs 60 unauthenticated).
 
@@ -168,8 +178,9 @@ All four steps are incremental and idempotent, so they can be run on a cron sche
 - **git_commits** — full commit history from local clones (authors, file changes, insertions/deletions)
 - **github_prs** — PR metadata, bodies, review comments, issue comments (complete API data as JSON)
 - **github_issues** — issue metadata and bodies
-- **pr_assessments** — AI-generated analysis per PR: tier, complexity, risk, narrative summary, per-participant contributions, lessons learned, outcome assessment, cross-references to related PRs/issues, test coverage evolution from initial submission to merge
+- **pr_assessments** — AI-generated analysis per PR: tier, complexity, risk, narrative summary, per-participant contributions, lessons learned, outcome assessment, cross-references to related PRs/issues, test coverage evolution from initial submission to merge. For open PRs: per-person pending actions (what's on each participant's plate), merge readiness classification (not_ready/possibly_ready/merge_ready), per-reviewer sentiment, and staleness detection.
 - **ai_digests** — cached AI outputs with content hashes, so unchanged data is never re-analyzed
+- **project_config** — governance settings (merge authorities, trust tiers) synced from the project config YAML on each scan
 - **analysis_runs** — when each scan or indexing job ran
 
 Contributor roles and expertise are not manually assigned — they emerge from AI analysis of the indexed data.
