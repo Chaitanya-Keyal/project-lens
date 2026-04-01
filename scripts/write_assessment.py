@@ -127,6 +127,17 @@ async def main():
     if isinstance(assessments, dict):
         assessments = [assessments]
 
+    # Validate before writing anything
+    from scripts.validate_assessment import validate
+    errors = validate(assessments)
+    if errors:
+        print(f"VALIDATION FAILED — {len(errors)} error(s):")
+        for e in errors:
+            print(f"  - {e}")
+        print(f"\nFix the errors and re-run.")
+        sys.exit(1)
+    print(f"Validation passed for {len(assessments)} assessment(s).")
+
     for a in assessments:
         await write_assessment(a)
 

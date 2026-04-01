@@ -108,56 +108,62 @@ asyncio.run(dump())
 
 ## Step 2: Generate assessments
 
-For each PR, produce a JSON assessment with this structure:
+For each PR, fill in this exact JSON skeleton. Do not add, remove, or rename any fields.
+
+For **closed/merged PRs**, omit `pending_actions`, `merge_readiness`, `merge_readiness_rationale`, `reviewer_sentiment`, and `stale_reason` entirely.
 
 ```json
 {
   "repo": "Owner/RepoName",
-  "pr_number": 123,
-  "tier": 0-3,
-  "merge_target": "login of the appropriate merge authority from Step 0, or blocked",
-  "tested_on_hardware": true/false,
+  "pr_number": 0,
+  "tier": 0,
+  "merge_target": "github_login or blocked",
+  "tested_on_hardware": false,
   "complexity": "trivial|low|medium|high",
   "risk": "low|medium|high",
-  "summary": "Brief narrative of what the PR does and what happened during review.",
-  "recommendation": "Assessment of the PR's significance and any notable aspects.",
+  "summary": "Narrative of what the PR does and what happened during review.",
+  "recommendation": "Assessment of the PR's significance.",
   "outcome": {
     "category": "feature|bugfix|refactor|cleanup|security|docs|l10n|performance|testing",
     "impact": "What changed for users or the codebase",
-    "review_improved_outcome": true/false,
-    "review_improvement": "How review made the result better (or null)"
+    "review_improved_outcome": false,
+    "review_improvement": "How review made the result better, or null"
   },
   "cross_references": [
-    {"type": "spawned|depends_on|fixes|related_to|discussed_in", "target": "...", "note": "..."}
+    {"type": "spawned|depends_on|fixes|related_to|discussed_in", "target": "Owner/Repo#123", "note": "context"}
   ],
   "participant_contributions": [
     {
-      "github_username": "...",
+      "github_username": "login",
       "role": "author|reviewer_primary|reviewer_secondary|reviewer",
       "contributions": [
-        {"type": "...", "detail": "..."}
+        {"type": "contribution_type", "detail": "What they did"}
       ]
     }
   ],
   "lessons_learned": [
-    {"category": "architecture|process|code_quality|testing|security|l10n|performance",
-     "principle": "The reusable takeaway",
-     "detail": "Specific context from this PR",
-     "source": "Who articulated it"}
+    {
+      "category": "architecture|process|code_quality|testing|security|l10n|performance",
+      "principle": "The reusable takeaway",
+      "detail": "Specific context from this PR",
+      "source": "Who articulated it"
+    }
   ],
-  "reviews": [{"user": "...", "type": "APPROVED|COMMENTED|CHANGES_REQUESTED"}],
+  "reviews": [
+    {"user": "login", "type": "APPROVED|COMMENTED|CHANGES_REQUESTED"}
+  ],
   "pending_actions": {
-    "<username>": {
+    "username": {
       "role": "author|reviewer",
       "open_items": 0,
-      "summary": "What's on this person's plate for this PR",
-      "last_activity_at": "YYYY-MM-DD of their last comment/review in the PR data above"
+      "summary": "username needs to do X (must start with their username)",
+      "last_activity_at": "YYYY-MM-DD"
     }
   },
   "merge_readiness": "not_ready|possibly_ready|merge_ready",
   "merge_readiness_rationale": "Brief explanation of the classification",
   "reviewer_sentiment": [
-    {"reviewer": "...", "sentiment": "one-word characterization", "needs": "what author needs to do for this reviewer"}
+    {"reviewer": "login", "sentiment": "one_word", "needs": "What author should do"}
   ],
   "stale_reason": "neglected|indecisive|soft_rejected|null"
 }
@@ -168,12 +174,18 @@ architectural_guidance, bug_catch, code_suggestion, tested_ack, ack, rubber_stam
 edge_case_found, naming_improvement, test_coverage_request, mentoring, process_feedback,
 hardware_tested, security_review, feature_implementation, responsive_to_feedback, performance_improvement
 
-### Strict schema rules
-- **merge_readiness** must be exactly one of: `not_ready`, `possibly_ready`, `merge_ready`. No other values.
-- **reviewer_sentiment** must be an array of objects, each with `reviewer` (string), `sentiment` (one word: supportive, skeptical, neutral, concerned, satisfied, constructive, etc.), `needs` (string). Not a dict. Keep `sentiment` to a single word.
-- **pending_actions** must be a dict keyed by GitHub username, each with `role` (string), `open_items` (integer — approximate count of unaddressed items), `summary` (string), `last_activity_at` (date string, YYYY-MM-DD, from the comment/review timestamps in the PR data). Not an array. `open_items` is a number, not a list.
-- **merge_target** must be the GitHub login of a merge authority from Step 0, or `"blocked"`.
-- All field names and structures must match the JSON template exactly. Do not invent new fields or change the shape.
+### Schema rules — the write script will reject output that violates these:
+- `tier`: integer 0-3.
+- `complexity`: one of `trivial`, `low`, `medium`, `high`.
+- `risk`: one of `low`, `medium`, `high`.
+- `merge_target`: GitHub login of a merge authority from Step 0, or `"blocked"`.
+- `merge_readiness`: one of `not_ready`, `possibly_ready`, `merge_ready`.
+- `stale_reason`: one of `neglected`, `indecisive`, `soft_rejected`, or `null`.
+- `reviewer_sentiment`: array of objects with `reviewer` (string), `sentiment` (single word, no spaces), `needs` (string).
+- `pending_actions`: dict keyed by GitHub username, each with `role` (string), `open_items` (integer), `summary` (string starting with the username), `last_activity_at` (YYYY-MM-DD string).
+- `reviews[].type`: one of `APPROVED`, `COMMENTED`, `CHANGES_REQUESTED`.
+- `outcome.category`: one of `feature`, `bugfix`, `refactor`, `cleanup`, `security`, `docs`, `l10n`, `performance`, `testing`.
+- Do not invent new fields or change the shape.
 
 ### Guidelines
 - Deduplicate participant contributions by substance — if the same point is made across multiple comments, describe it once. Preserve distinct contributions even if they share the same type.
@@ -223,6 +235,8 @@ Write the batch as a JSON array to a temp file, then run:
 ```bash
 source .venv/bin/activate && DEBUG=false python scripts/write_assessment.py --file /tmp/pr_batch_assessments.json
 ```
+
+The write script validates the JSON schema before writing. If it prints validation errors, read each error, fix the JSON file accordingly, and re-run the write script. Repeat until it succeeds.
 
 ## Step 4: Report progress
 
