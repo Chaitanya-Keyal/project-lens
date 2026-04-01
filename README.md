@@ -169,7 +169,15 @@ python scripts/extract_contributors.py
 #    Resumable — picks up where it left off if interrupted
 ./scripts/run_batch_assess.sh
 
-# 5. Test coverage at each PR's initial submission and merge point
+# 5. Ingest Telegram group chat history (if applicable)
+#    Import from Telegram Desktop JSON export, then run bot for ongoing messages
+python scripts/telegram_ingest.py --import-json /path/to/result.json
+
+# 6. AI digestion of Telegram discussions
+#    Extracts substantive threads, discards noise, captures per-person positions
+claude -p "$(cat scripts/telegram_digest_prompt.md)"
+
+# 7. Test coverage at each PR's initial submission and merge point
 #    Only for repos with a pytest-based test suite
 python scripts/calculate_coverage.py
 ```
@@ -182,24 +190,34 @@ python scripts/calculate_coverage.py
 - **Shipped code** — whose authored PRs get accepted and merged
 - **Review engagement** — total PR interaction (formal reviews + inline code comments + discussion comments)
 
-Each dimension is scored as high/moderate/low/none based on the project's own distribution (mean + 1 standard deviation thresholds). This produces contributor profiles that downstream AI steps (PR assessments) use to understand who the key people are and what roles they play — without any manual configuration.
+Each dimension is scored as high/moderate/low/none based on the project's own distribution (mean + 1 standard deviation thresholds). This produces contributor profiles that downstream AI steps (PR assessments, Telegram digestion) use to understand who the key people are and what roles they play — without any manual configuration.
 
 **Step 4** is the AI analysis pass — it reads stored PR data from the database, generates structured assessments, and writes them back. Each PR is committed individually, so progress is never lost.
 
-**Step 5** is optional — only applicable to repos with pytest-based test suites.
+**Steps 5-6** handle Telegram group chat ingestion. Step 5 imports historical messages from a Telegram Desktop JSON export into a separate database (so chat data can be selectively shared independent of GitHub data). Step 6 runs an AI analysis that processes messages in weekly batches, extracting substantive discussion threads and discarding noise. The AI uses the contributor profiles from step 3 to understand who the key participants are. For ongoing ingestion, the Telegram bot can run in polling mode (`--poll`) to capture new messages in real time.
+
+**Step 7** is optional — only applicable to repos with pytest-based test suites.
 
 All steps are incremental and idempotent, so they can be run on a cron schedule to keep the index current as the project evolves.
 
 ## What's in the database
+
+Project Lens uses two SQLite databases. The main database holds GitHub data, assessments, and contributor profiles. Telegram messages go in a separate database so they can be selectively shared.
+
+**Main database:**
 
 - **git_commits** — full commit history from local clones (authors, file changes, insertions/deletions)
 - **github_prs** — PR metadata, bodies, review comments, issue comments (complete API data as JSON)
 - **github_issues** — issue metadata and bodies
 - **contributor_profiles** — data-derived profiles per contributor: GitHub login, display names seen across systems, activity stats, and per-dimension tier scores (merge authority, shipped code, review engagement)
 - **pr_assessments** — AI-generated analysis per PR: tier, complexity, risk, narrative summary, per-participant contributions, lessons learned, outcome assessment, cross-references to related PRs/issues, test coverage evolution from initial submission to merge. For open PRs: per-person pending actions (what's on each participant's plate), merge readiness classification (not_ready/possibly_ready/merge_ready), per-reviewer sentiment, and staleness detection.
-- **ai_digests** — cached AI outputs with content hashes, so unchanged data is never re-analyzed
+- **ai_digests** — cached AI outputs with content hashes, so unchanged data is never re-analyzed. Includes PR assessment digests and Telegram thread summaries.
 - **project_config** — governance settings (merge authorities) synced from the project config YAML on each scan
 - **analysis_runs** — when each scan or indexing job ran
+
+**Telegram database** (separate file):
+
+- **telegram_msgs** — ingested group chat messages with sender info, reply threading, message type, and reaction data (who reacted with what emoji)
 
 Contributor roles and expertise are not manually assigned — they emerge from analysis of the indexed data.
 
