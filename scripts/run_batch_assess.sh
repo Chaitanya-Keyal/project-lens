@@ -1,22 +1,56 @@
 #!/bin/bash
-# Run unattended PR assessment batch job via Claude Code
+# Run PR assessment in a loop — one batch per claude -p invocation.
+# Fresh context each time, no wasted tokens on accumulated history.
+# Each run picks up where the last left off (unassessed PRs query).
+#
 # Usage: ./scripts/run_batch_assess.sh
 #
 # Logs to var/batch_assess.log
 
 set -e
-cd /home/kdmukai/dev/tools/project-lens
+cd "$(dirname "$0")/.."
+source .venv/bin/activate
 
 mkdir -p var
 
-PROMPT=$(cat scripts/batch_assess_prompt.md)
+batch_count=0
 
-echo "$(date): Starting batch assessment run" >> var/batch_assess.log
+while true; do
+    # Check if there are unassessed PRs remaining
+    remaining=$(DEBUG=false python -c "
+import asyncio
+from backend.database import async_session
+from backend.models import GithubPR, PRAssessment
+from sqlalchemy import select
 
-claude -p \
-  --permission-mode bypassPermissions \
-  --max-turns 50 \
-  "$PROMPT" \
-  >> var/batch_assess.log 2>&1
+async def check():
+    async with async_session() as s:
+        assessed = await s.execute(select(PRAssessment.repo, PRAssessment.pr_number))
+        assessed_set = {(r[0], r[1]) for r in assessed.all()}
+        result = await s.execute(
+            select(GithubPR)
+            .where(GithubPR.detail_fetched_at.is_not(None))
+        )
+        prs = [p for p in result.scalars().all() if (p.repo, p.number) not in assessed_set]
+        print(len(prs))
 
-echo "$(date): Batch assessment run complete" >> var/batch_assess.log
+asyncio.run(check())
+")
+
+    if [ "$remaining" = "0" ]; then
+        echo "$(date): All PRs assessed after $batch_count batches." >> var/batch_assess.log
+        echo "All PRs assessed after $batch_count batches."
+        break
+    fi
+
+    batch_count=$((batch_count + 1))
+    echo "$(date): Starting batch $batch_count ($remaining PRs remaining)" >> var/batch_assess.log
+
+    claude -p \
+      --permission-mode bypassPermissions \
+      --max-turns 50 \
+      "$(cat scripts/batch_assess_prompt.md)" \
+      >> var/batch_assess.log 2>&1 || true
+
+    echo "$(date): Batch $batch_count complete" >> var/batch_assess.log
+done

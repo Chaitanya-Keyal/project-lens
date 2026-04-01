@@ -1,0 +1,22 @@
+# Systemd service for Telegram message ingestion (read-only)
+# Install: sudo cp scripts/telegram-ingest.service /etc/systemd/system/
+#          sudo systemctl enable --now telegram-ingest
+#
+# Requires TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in .env
+
+[Unit]
+Description=Project Lens Telegram Ingestion Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=kdmukai
+WorkingDirectory=/home/kdmukai/dev/tools/project-lens
+ExecStart=/home/kdmukai/dev/tools/project-lens/.venv/bin/python scripts/telegram_ingest.py --config-dir /home/kdmukai/dev/tools/project-lens-seedsigner-config --poll
+Restart=always
+RestartSec=30
+Environment=DEBUG=false
+
+[Install]
+WantedBy=multi-user.target

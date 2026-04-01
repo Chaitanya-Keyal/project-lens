@@ -238,27 +238,10 @@ source .venv/bin/activate && DEBUG=false python scripts/write_assessment.py --fi
 
 The write script validates the JSON schema before writing. If it prints validation errors, read each error, fix the JSON file accordingly, and re-run the write script. Repeat until it succeeds.
 
-## Step 4: Report progress
+## Step 4: Report and exit
 
-After writing, run:
+After writing, report what was processed and exit. The outer loop script will relaunch with a fresh context for the next batch.
 
-```bash
-source .venv/bin/activate && DEBUG=false python -c "
-import asyncio
-from backend.database import async_session
-from backend.models import PRAssessment, GithubPR
-from sqlalchemy import select, func
-
-async def check():
-    async with async_session() as s:
-        r = await s.execute(select(func.count(PRAssessment.id)))
-        assessed = r.scalar()
-        r = await s.execute(select(func.count(GithubPR.id)))
-        total = r.scalar()
-        print(f'Assessments: {assessed}/{total} PRs')
-
-asyncio.run(check())
-"
 ```
-
-Repeat steps 1-4 until all PRs are assessed or you run out of context.
+Assessed N PRs in this batch.
+```

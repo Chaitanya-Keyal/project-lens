@@ -245,13 +245,12 @@ source .venv/bin/activate && DEBUG=false python scripts/write_telegram_digest.py
 
 The write script validates the JSON schema before writing. If it prints validation errors, read each error, fix the JSON file accordingly, and re-run the write script. Repeat until it succeeds.
 
-## Step 5: Repeat
+## Step 5: Report and exit
 
-Go back to Step 1 and fetch the next batch. Continue until you see `ALL_PROCESSED` or you run low on context. After each batch is written, report progress:
+After writing the batch, report what was processed and exit. The outer loop script will relaunch with a fresh context for the next batch.
 
 ```
 Batch 2023-01-01 to 2023-01-08: N threads extracted, M messages processed
-Remaining: XXXX unprocessed
 ```
 
 ## Guidelines

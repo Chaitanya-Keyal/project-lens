@@ -107,6 +107,7 @@ python scripts/index_git_history.py        # clone repos, index git history
 python scripts/github_scan.py              # fetch PRs, issues, reviews from GitHub API
 python scripts/extract_contributors.py     # derive contributor profiles + activity tiers
 ./scripts/run_batch_assess.sh              # AI assessment of all PRs
+python scripts/embed_digests.py            # embed into ChromaDB for semantic search
 ```
 
 ## Project config
@@ -174,12 +175,16 @@ python scripts/extract_contributors.py
 python scripts/telegram_ingest.py --import-json /path/to/result.json
 
 # 6. AI digestion of Telegram discussions
-#    Extracts substantive threads, discards noise, captures per-person positions
-claude -p "$(cat scripts/telegram_digest_prompt.md)"
+#    One batch per invocation; loop script handles iteration
+./scripts/run_telegram_digest.sh
 
 # 7. Test coverage at each PR's initial submission and merge point
 #    Only for repos with a pytest-based test suite
 python scripts/calculate_coverage.py
+
+# 8. Embed all digested content into ChromaDB for semantic search
+#    Incremental — only embeds new or changed content using content hashing
+python scripts/embed_digests.py
 ```
 
 **Steps 1-3** are fast and free — just git operations, GitHub API calls, and local computation. Step 2 is rate-limited by the GitHub API but only needs a full fetch once; after that, it incrementally fetches only PRs with new activity.
@@ -194,11 +199,13 @@ Each dimension is scored as high/moderate/low/none based on the project's own di
 
 **Step 4** is the AI analysis pass — it reads stored PR data from the database, generates structured assessments, and writes them back. Each PR is committed individually, so progress is never lost.
 
-**Steps 5-6** handle Telegram group chat ingestion. Step 5 imports historical messages from a Telegram Desktop JSON export into a separate database (so chat data can be selectively shared independent of GitHub data). Step 6 runs an AI analysis that processes messages in weekly batches, extracting substantive discussion threads and discarding noise. The AI uses the contributor profiles from step 3 to understand who the key participants are. For ongoing ingestion, the Telegram bot can run in polling mode (`--poll`) to capture new messages in real time.
+**Steps 5-6** handle Telegram group chat ingestion. Step 5 imports historical messages from a Telegram Desktop JSON export into a separate database (so chat data can be selectively shared independent of GitHub data). Step 6 runs an AI analysis that processes messages in weekly batches, extracting substantive discussion threads and discarding noise — one batch per `claude -p` invocation for fresh context each time, with the loop script handling iteration. The AI uses the contributor profiles from step 3 to understand who the key participants are. For ongoing ingestion, the Telegram bot can run in polling mode (`--poll`) to capture new messages in real time.
 
 **Step 7** is optional — only applicable to repos with pytest-based test suites.
 
-All steps are incremental and idempotent, so they can be run on a cron schedule to keep the index current as the project evolves.
+**Step 8** embeds all AI-digested content into ChromaDB for semantic search. This includes PR assessment summaries and Telegram thread digests. The embedding script uses content hashing to detect changes — new items get added, modified items get re-embedded, and unchanged items are skipped. Uses `all-MiniLM-L6-v2` on GPU if available. ChromaDB storage lives alongside the main database in the config repo's `var/chroma/` directory.
+
+All steps are incremental and idempotent, so they can be run on a cron schedule to keep the index current as the project evolves. A typical cron cycle runs all eight steps in sequence — each one only processes what's new or changed since the last run.
 
 ## What's in the database
 
@@ -219,11 +226,17 @@ Project Lens uses two SQLite databases. The main database holds GitHub data, ass
 
 - **telegram_msgs** — ingested group chat messages with sender info, reply threading, message type, and reaction data (who reacted with what emoji)
 
+**ChromaDB** (vector database for semantic search):
+
+- **telegram_threads** — embedded thread summaries from Telegram digestion, searchable by topic and content
+- **pr_assessments** — embedded PR assessment summaries, searchable by what the PR did, who was involved, and what was learned
+
+Collections use cosine similarity with `all-MiniLM-L6-v2` embeddings. Content hashing ensures only changed documents are re-embedded on each run.
+
 Contributor roles and expertise are not manually assigned — they emerge from analysis of the indexed data.
 
 ## Planned
 
-- **Semantic search** — embed all AI-digested content into a vector database (ChromaDB) for similarity search across the full project history. "What did we discuss about SeedXOR?" returns relevant PR discussions, Telegram threads, and decision records.
 - **Translation completeness tracking** — parse `.po` files to track per-language translation progress over time, with both string-based and word-weighted completion metrics.
 
 ## License
