@@ -1,8 +1,57 @@
-You are running as an unattended batch job for the project-lens indexer. Your task is to generate PR assessments for SeedSigner PRs that don't have them yet.
+You are running as an unattended batch job for the project-lens indexer. Your task is to generate PR assessments for PRs that don't have them yet.
 
 ## Setup
 Working directory: /home/kdmukai/dev/tools/project-lens
 Python venv: source .venv/bin/activate
+
+## Step 0: Load contributor and project context
+
+Run this to get contributor profiles and merge authorities from the database. Use this context when assessing reviews, merge readiness, and participant contributions.
+
+```bash
+source .venv/bin/activate && DEBUG=false python -c "
+import asyncio, json
+from backend.database import async_session
+from backend.models import ContributorProfile, ProjectConfigEntry
+from sqlalchemy import select
+
+async def show():
+    async with async_session() as s:
+        # Contributor profiles
+        result = await s.execute(
+            select(ContributorProfile)
+            .order_by(ContributorProfile.last_active.desc())
+        )
+        print('=== Contributor Profiles ===')
+        for p in result.scalars():
+            s_ = p.stats
+            total = s_.get('merge_commits',0) + s_.get('prs_merged',0) + s_.get('total_review_engagement',0)
+            if total < 5:
+                continue
+            mt = s_.get('merge_tier', 'none')
+            pt = s_.get('pr_tier', 'none')
+            rt = s_.get('review_tier', 'none')
+            print(f'{p.github_login} — merges:{mt} shipped:{pt} reviews:{rt} — {s_.get(\"merge_commits\",0)} merges, {s_.get(\"prs_merged\",0)} PRs merged, {s_.get(\"total_review_engagement\",0)} review engagements')
+
+        # Merge authorities from project config
+        result = await s.execute(
+            select(ProjectConfigEntry).where(ProjectConfigEntry.key == 'merge_authorities')
+        )
+        entry = result.scalar_one_or_none()
+        if entry:
+            print()
+            print('=== Merge Authorities ===')
+            for ma in entry.value:
+                print(f'{ma[\"login\"]} — scope: {ma[\"scope\"]} — {ma.get(\"description\", \"\")}')
+
+asyncio.run(show())
+"
+```
+
+Use the tier scores to weight reviews and assess merge readiness:
+- Contributors with **high** merge tier are merge authorities — their ACK carries the most weight.
+- Contributors with **high** or **moderate** review tier are experienced reviewers — their substantive review satisfies the "trusted review" prerequisite for merge readiness.
+- Contributors with only **low** or **none** tiers are newer participants — their reviews are still valuable but don't alone satisfy merge readiness requirements.
 
 ## Step 1: Find unassessed PRs
 Run this to get the next batch of unassessed PRs with their review data:
@@ -36,23 +85,21 @@ async def dump():
             reviews = pr.reviews_json or []
             review_comments = pr.review_comments_json or []
             issue_comments = pr.issue_comments_json or []
-            print(f'--- PR #{pr.number}: {pr.title} ---')
+            print(f'--- {pr.repo} PR #{pr.number}: {pr.title} ---')
             print(f'Author: {pr.author} | State: {pr.state} | Labels: {pr.labels}')
             if pr.merged_at_gh: print(f'Merged: {str(pr.merged_at_gh)[:10]}')
             if pr.closed_at_gh and not pr.merged_at_gh: print(f'Closed: {str(pr.closed_at_gh)[:10]}')
             print(f'Body: {(pr.body or \"\")[:400]}')
             print(f'Reviews ({len(reviews)}):')
-            for r in reviews[:10]:
-                print(f'  {r[\"user\"][\"login\"]}: {r[\"state\"]} - {(r.get(\"body\") or \"\")[:150]}')
-            if len(reviews) > 10: print(f'  ... and {len(reviews)-10} more')
+            for r in reviews:
+                print(f'  [{r.get(\"submitted_at\",\"?\")[:10]}] {r[\"user\"][\"login\"]}: {r[\"state\"]} - {(r.get(\"body\") or \"\")[:200]}')
             print(f'Review comments ({len(review_comments)}):')
-            for c in review_comments[:8]:
-                print(f'  {c[\"user\"][\"login\"]}: {(c.get(\"body\") or \"\")[:150]}')
-            if len(review_comments) > 8: print(f'  ... and {len(review_comments)-8} more')
+            for c in review_comments:
+                print(f'  [{c.get(\"created_at\",\"?\")[:10]}] {c[\"user\"][\"login\"]}: {(c.get(\"body\") or \"\")[:200]}')
             print(f'Issue comments ({len(issue_comments)}):')
-            for c in issue_comments[:8]:
-                print(f'  {c[\"user\"][\"login\"]}: {(c.get(\"body\") or \"\")[:150]}')
-            if len(issue_comments) > 8: print(f'  ... and {len(issue_comments)-8} more')
+            for c in issue_comments:
+                print(f'  [{c.get(\"created_at\",\"?\")[:10]}] {c[\"user\"][\"login\"]}: {(c.get(\"body\") or \"\")[:200]}')
+
             print()
 
 asyncio.run(dump())
@@ -65,10 +112,10 @@ For each PR, produce a JSON assessment with this structure:
 
 ```json
 {
-  "repo": "SeedSigner/seedsigner",
+  "repo": "Owner/RepoName",
   "pr_number": 123,
   "tier": 0-3,
-  "merge_target": "nick|seedsigner-account|blocked|other",
+  "merge_target": "login of the appropriate merge authority from Step 0, or blocked",
   "tested_on_hardware": true/false,
   "complexity": "trivial|low|medium|high",
   "risk": "low|medium|high",
@@ -104,7 +151,7 @@ For each PR, produce a JSON assessment with this structure:
       "role": "author|reviewer",
       "open_items": 0,
       "summary": "What's on this person's plate for this PR",
-      "last_activity_at": "ISO timestamp of their last activity"
+      "last_activity_at": "YYYY-MM-DD of their last comment/review in the PR data above"
     }
   },
   "merge_readiness": "not_ready|possibly_ready|merge_ready",
@@ -121,15 +168,12 @@ architectural_guidance, bug_catch, code_suggestion, tested_ack, ack, rubber_stam
 edge_case_found, naming_improvement, test_coverage_request, mentoring, process_feedback,
 hardware_tested, security_review, feature_implementation, responsive_to_feedback, performance_improvement
 
-### Trust tiers (for weighting reviews and merge readiness)
-- **Core**: newtonick (lead maintainer, merge authority for code), kdmukai (co-maintainer)
-- **Trusted**: jdlcdl, alvroble, Chaitanya-Keyal
-- **Known**: contributors with merged PRs
-- **New**: everyone else
-
-### Merge authorities
-- **newtonick**: technical PRs (code, architecture, crypto)
-- **SeedSigner** (org account): non-technical PRs (docs, translations, config)
+### Strict schema rules
+- **merge_readiness** must be exactly one of: `not_ready`, `possibly_ready`, `merge_ready`. No other values.
+- **reviewer_sentiment** must be an array of objects, each with `reviewer` (string), `sentiment` (one word: supportive, skeptical, neutral, concerned, satisfied, constructive, etc.), `needs` (string). Not a dict. Keep `sentiment` to a single word.
+- **pending_actions** must be a dict keyed by GitHub username, each with `role` (string), `open_items` (integer — approximate count of unaddressed items), `summary` (string), `last_activity_at` (date string, YYYY-MM-DD, from the comment/review timestamps in the PR data). Not an array. `open_items` is a number, not a list.
+- **merge_target** must be the GitHub login of a merge authority from Step 0, or `"blocked"`.
+- All field names and structures must match the JSON template exactly. Do not invent new fields or change the shape.
 
 ### Guidelines
 - Deduplicate participant contributions by substance — if the same point is made across multiple comments, describe it once. Preserve distinct contributions even if they share the same type.
@@ -151,12 +195,16 @@ Closed/merged PRs only need the core assessment fields (tier, complexity, risk, 
 - A commit that addresses feedback counts even without explicit replies to each comment.
 - For PRs with no reviewer engagement: author has 0 items, summary says "No reviewers have engaged yet."
 - For closed/merged PRs: all participants have 0 items (nothing pending).
+- **summary must name the person by their GitHub username explicitly.** The downstream consumer displays each person's summary in a personalized context where "the author" or an omitted subject is ambiguous. Always write the summary so it reads clearly standalone.
+  - Good: "kdmukai needs to address 2 review comments from newtonick"
+  - Bad: "needs to address 2 review comments" (who?)
+  - Bad: "the author needs to address 2 review comments" (impersonal)
 
 ### Merge readiness guidelines
-- **not_ready**: No ACK from a trusted/core reviewer on a non-trivial PR, or substantial unresolved review threads. Most PRs are not_ready — that's normal.
-- **possibly_ready**: Has substantive ACK(s) from trusted/core reviewer(s), but the PR's complexity or risk warrants the lead maintainer's own review. The prerequisite is at least one substantive review from someone the project trusts — an ACK from a new contributor or a drive-by LGTM doesn't qualify.
-- **merge_ready**: Trusted ACKs, CI presumably passing, review threads resolved. Conservative threshold — if there's doubt, use possibly_ready.
-- merge_target should reflect which merge authority should handle: "nick" for code PRs, "seedsigner-account" for non-technical PRs.
+- **not_ready**: No ACK from a reviewer with high or moderate review tier on a non-trivial PR, or substantial unresolved review threads. Most PRs are not_ready — that's normal.
+- **possibly_ready**: Has substantive ACK(s) from reviewer(s) with high/moderate review tier, but the PR's complexity or risk warrants review from a merge authority (high merge tier). The prerequisite is at least one substantive review from an established reviewer — an ACK from a low/none-tier contributor or a drive-by LGTM doesn't qualify.
+- **merge_ready**: ACKs from established reviewers, CI presumably passing, review threads resolved. Conservative threshold — if there's doubt, use possibly_ready.
+- merge_target should reflect which merge authority should handle based on their scope (from the Merge Authorities list in Step 0).
 
 ### Reviewer sentiment guidelines
 - Characterize each reviewer's current stance in one word (supportive, skeptical, neutral, concerned, satisfied, redirecting, etc.)

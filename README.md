@@ -102,9 +102,10 @@ pip install -e .
 cp .env.example .env
 # Edit .env to point PROJECT_CONFIG_DIR at your config repo (see below)
 
-# Index
+# Index (see Ingestion section below for full details)
 python scripts/index_git_history.py        # clone repos, index git history
 python scripts/github_scan.py              # fetch PRs, issues, reviews from GitHub API
+python scripts/extract_contributors.py     # derive contributor profiles + activity tiers
 ./scripts/run_batch_assess.sh              # AI assessment of all PRs
 ```
 
@@ -149,7 +150,7 @@ Set `GITHUB_TOKEN` in `.env` for authenticated API access (5,000 req/hr vs 60 un
 
 ## Ingestion
 
-Once configured, ingestion happens in three steps:
+Once configured, ingestion runs in a prescribed order. Each step builds on the data from previous steps.
 
 ```bash
 # 1. Clone repos and index full git history (seconds, no API calls)
@@ -159,37 +160,52 @@ python scripts/index_git_history.py
 #    First run fetches complete history; subsequent runs are incremental
 python scripts/github_scan.py
 
-# 3. AI assessment of every PR
+# 3. Extract contributor profiles from git + GitHub data
+#    Resolves identities across systems, computes per-dimension activity tiers
+python scripts/extract_contributors.py
+
+# 4. AI assessment of every PR
 #    Currently uses Claude Code in headless mode; adaptable to other AI providers
 #    Resumable — picks up where it left off if interrupted
 ./scripts/run_batch_assess.sh
 
-# 4. Test coverage at each PR's initial submission and merge point
+# 5. Test coverage at each PR's initial submission and merge point
 #    Only for repos with a pytest-based test suite
 python scripts/calculate_coverage.py
 ```
 
-Steps 1 and 4 are fast and free — just git operations and local test runs. Step 2 is rate-limited by the GitHub API but only needs to do a full fetch once; after that, it incrementally fetches only PRs with new activity. Step 3 is the AI analysis pass — it reads the stored PR data from the database, generates structured assessments, and writes them back. Each PR is committed individually, so progress is never lost.
+**Steps 1-3** are fast and free — just git operations, GitHub API calls, and local computation. Step 2 is rate-limited by the GitHub API but only needs a full fetch once; after that, it incrementally fetches only PRs with new activity.
 
-All four steps are incremental and idempotent, so they can be run on a cron schedule to keep the index current as the project evolves.
+**Step 3** (contributor extraction) must run after steps 1 and 2 because it derives profiles from both git history and GitHub PR data. It resolves contributor identities across systems (git author names/emails → GitHub logins), then scores each contributor across three independent dimensions using statistical bands:
+
+- **Merge authority** — who merges other people's PRs (merge commits)
+- **Shipped code** — whose authored PRs get accepted and merged
+- **Review engagement** — total PR interaction (formal reviews + inline code comments + discussion comments)
+
+Each dimension is scored as high/moderate/low/none based on the project's own distribution (mean + 1 standard deviation thresholds). This produces contributor profiles that downstream AI steps (PR assessments) use to understand who the key people are and what roles they play — without any manual configuration.
+
+**Step 4** is the AI analysis pass — it reads stored PR data from the database, generates structured assessments, and writes them back. Each PR is committed individually, so progress is never lost.
+
+**Step 5** is optional — only applicable to repos with pytest-based test suites.
+
+All steps are incremental and idempotent, so they can be run on a cron schedule to keep the index current as the project evolves.
 
 ## What's in the database
 
 - **git_commits** — full commit history from local clones (authors, file changes, insertions/deletions)
 - **github_prs** — PR metadata, bodies, review comments, issue comments (complete API data as JSON)
 - **github_issues** — issue metadata and bodies
+- **contributor_profiles** — data-derived profiles per contributor: GitHub login, display names seen across systems, activity stats, and per-dimension tier scores (merge authority, shipped code, review engagement)
 - **pr_assessments** — AI-generated analysis per PR: tier, complexity, risk, narrative summary, per-participant contributions, lessons learned, outcome assessment, cross-references to related PRs/issues, test coverage evolution from initial submission to merge. For open PRs: per-person pending actions (what's on each participant's plate), merge readiness classification (not_ready/possibly_ready/merge_ready), per-reviewer sentiment, and staleness detection.
 - **ai_digests** — cached AI outputs with content hashes, so unchanged data is never re-analyzed
-- **project_config** — governance settings (merge authorities, trust tiers) synced from the project config YAML on each scan
+- **project_config** — governance settings (merge authorities) synced from the project config YAML on each scan
 - **analysis_runs** — when each scan or indexing job ran
 
-Contributor roles and expertise are not manually assigned — they emerge from AI analysis of the indexed data.
+Contributor roles and expertise are not manually assigned — they emerge from analysis of the indexed data.
 
 ## Planned
 
 - **Semantic search** — embed all AI-digested content into a vector database (ChromaDB) for similarity search across the full project history. "What did we discuss about SeedXOR?" returns relevant PR discussions, Telegram threads, and decision records.
-- **Contributor profiles** — AI-generated characterizations of each contributor's activity, expertise areas, engagement trajectory, and review style, refreshed as new data is indexed.
-- **Telegram ingestion** — ingest group chat history and extract decisions, action items, and topic-level summaries.
 - **Translation completeness tracking** — parse `.po` files to track per-language translation progress over time, with both string-based and word-weighted completion metrics.
 
 ## License

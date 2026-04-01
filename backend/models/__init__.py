@@ -11,6 +11,7 @@ from backend.models.ai_digest import AIDigest
 from backend.models.git_commit import GitCommit
 from backend.models.analysis_run import AnalysisRun
 from backend.models.project_config_entry import ProjectConfigEntry
+from backend.models.contributor_profile import ContributorProfile
 
 __all__ = [
     "Base",
@@ -26,4 +27,5 @@ __all__ = [
     "APIUsage",
     "AnalysisRun",
     "ProjectConfigEntry",
+    "ContributorProfile",
 ]
