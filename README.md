@@ -98,9 +98,9 @@ python -m venv .venv
 source .venv/bin/activate
 pip install -e .
 
-# Configure
+# Configure — point the tool at your project config repo (see below)
 cp .env.example .env
-# Edit .env to point PROJECT_CONFIG_DIR at your config repo (see below)
+# Edit .env: set DEFAULT_CONFIG_DIR=/path/to/your-project-config
 
 # Index (see Ingestion section below for full details)
 python scripts/github/ingest/index_git_history.py     # clone repos, index git history
@@ -112,18 +112,11 @@ python scripts/embed_digests.py                        # embed into ChromaDB for
 
 ## Project config
 
-Each project you want to index gets its own config repo that holds the configuration and all generated data:
+Each project you want to index gets its own config directory (typically a separate repo) that holds project-specific configuration, secrets, and all generated data. Project Lens is generic — the tool knows nothing about any specific project.
 
-```
-project-lens-myproject-config/
-  config.yaml       # which repos to track
-  .env               # GITHUB_TOKEN (gitignored)
-  var/
-    project-lens.db  # the SQLite database
-    clones/          # dedicated git clones
-```
+Create a directory for your project and add two files:
 
-The config is minimal:
+**`config.yaml`** — which repos to track and who the gatekeepers are:
 
 ```yaml
 project:
@@ -147,7 +140,37 @@ repos:
 
 `merge_authorities` defines who can merge PRs and what kinds they handle. This drives the AI's merge readiness classification — it needs to know who the gatekeepers are and what scope each covers. The config is synced to the database on each scan so downstream consumers (dashboards, chatbots) can read it without accessing the YAML directly.
 
-Set `GITHUB_TOKEN` in `.env` for authenticated API access (5,000 req/hr vs 60 unauthenticated).
+**`.env`** — secrets and optional overrides:
+
+```bash
+GITHUB_TOKEN=ghp_...
+
+# Optional: Telegram ingestion
+# TELEGRAM_BOT_TOKEN=...
+# TELEGRAM_CHAT_ID=...
+
+# Optional overrides (derived automatically from config dir if not set)
+# DATABASE_URL=sqlite+aiosqlite:///var/project-lens.db
+# CLONES_DIR=var/clones
+# TELEGRAM_DATABASE_URL=sqlite+aiosqlite:///var/telegram.db
+# EMBEDDING_MODEL=BAAI/bge-large-en-v1.5
+# CHROMA_DIR=var/chroma
+```
+
+Set `GITHUB_TOKEN` for authenticated API access (5,000 req/hr vs 60 unauthenticated). All other settings have sensible defaults derived from the config directory.
+
+The resulting directory structure after indexing:
+
+```
+your-project-config/
+  config.yaml       # project configuration
+  .env               # secrets (gitignored)
+  var/
+    project-lens.db  # SQLite database
+    telegram.db      # Telegram messages (separate for selective sharing)
+    clones/          # dedicated git clones
+    chroma/          # ChromaDB vector embeddings
+```
 
 ## Ingestion
 

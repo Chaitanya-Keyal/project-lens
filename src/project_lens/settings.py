@@ -18,7 +18,7 @@ def _find_config_dir() -> Path | None:
             return Path(sys.argv[i + 1])
 
     # Check for dev default in tool repo .env
-    tool_env = Path(__file__).resolve().parent.parent / ".env"
+    tool_env = Path(__file__).resolve().parent.parent.parent / ".env"
     if tool_env.exists():
         for line in tool_env.read_text().splitlines():
             line = line.strip()
@@ -97,7 +97,7 @@ class Settings(BaseSettings):
             db_path = Path(self.database_url[len(prefix):])
             path = db_path.parent / "chroma"
         else:
-            path = Path(__file__).resolve().parent.parent / "var" / "chroma"
+            path = Path(__file__).resolve().parent.parent.parent / "var" / "chroma"
         path.mkdir(parents=True, exist_ok=True)
         return path
 
@@ -124,7 +124,7 @@ class Settings(BaseSettings):
         if self.clones_dir:
             path = Path(self.clones_dir)
         else:
-            path = Path(__file__).resolve().parent.parent / "var" / "clones"
+            path = Path(__file__).resolve().parent.parent.parent / "var" / "clones"
         path.mkdir(parents=True, exist_ok=True)
         return path
 
