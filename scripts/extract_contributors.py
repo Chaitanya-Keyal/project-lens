@@ -286,6 +286,10 @@ async def extract_profiles():
         written = 0
 
         for login, data in profiles.items():
+            # Skip unresolved email-keyed entries — only real GitHub logins get profiles
+            if "@" in login:
+                continue
+
             dates = [d for d in data["dates"] if d is not None]
             first_active = min(dates) if dates else None
             last_active = max(dates) if dates else None
@@ -341,6 +345,116 @@ async def extract_profiles():
             written += 1
 
         await session.commit()
+
+    # --- Link Telegram display names to contributor profiles ---
+    try:
+        from sqlalchemy.ext.asyncio import AsyncSession as TgAsyncSession, async_sessionmaker as tg_async_sessionmaker
+        from sqlalchemy.ext.asyncio import create_async_engine as tg_create_async_engine
+        from backend.config import settings
+
+        tg_engine = tg_create_async_engine(settings.telegram_db_url)
+        tg_session = tg_async_sessionmaker(tg_engine, class_=TgAsyncSession, expire_on_commit=False)
+
+        async with tg_session() as tg_s:
+            # Get top Telegram senders
+            from backend.models import TelegramMsg
+            result = await tg_s.execute(
+                select(TelegramMsg.from_user, func.count(TelegramMsg.id))
+                .where(TelegramMsg.from_user.is_not(None))
+                .group_by(TelegramMsg.from_user)
+                .having(func.count(TelegramMsg.id) >= 5)
+                .order_by(func.count(TelegramMsg.id).desc())
+            )
+            tg_senders = {name: count for name, count in result.all()}
+
+        if tg_senders:
+            import re as _re
+
+            def _normalize(name: str) -> str:
+                return _re.sub(r'[\s\-_.]', '', name.lower())
+
+            # --- Method 1: match Telegram names to existing profile display names ---
+            async with async_session() as session:
+                result = await session.execute(select(ContributorProfile))
+                all_profiles = result.scalars().all()
+
+                name_to_profile: dict[str, ContributorProfile] = {}
+                for p in all_profiles:
+                    name_to_profile[_normalize(p.github_login)] = p
+                    for dn in p.display_names:
+                        name_to_profile[_normalize(dn)] = p
+
+                tg_linked = 0
+                for tg_name in tg_senders:
+                    profile = name_to_profile.get(_normalize(tg_name))
+                    if profile and tg_name not in profile.display_names:
+                        # Respect the exclusion list
+                        if tg_name in (profile.excluded_names or []):
+                            continue
+                        updated = list(profile.display_names) + [tg_name]
+                        profile.display_names = sorted(set(updated))
+                        tg_linked += 1
+                        # Update the lookup so subsequent matches find this profile
+                        name_to_profile[_normalize(tg_name)] = profile
+
+                await session.commit()
+                if tg_linked:
+                    print(f"  Linked {tg_linked} Telegram names via display name matching")
+
+            # --- Method 2: self-identification messages ---
+            # People saying "I'm <username> on github" or "<username> on github"
+            # in short messages. Very high confidence when the claimed username
+            # matches a known GitHub login.
+            self_id_pattern = _re.compile(
+                r"""(?:i'?m|i\s+am)\s+(\w[\w-]+)\s+on\s+github"""
+                r"""|^(\w[\w-]+)\s+on\s+github""",
+                _re.IGNORECASE,
+            )
+            async with tg_session() as tg_s:
+                result = await tg_s.execute(
+                    select(TelegramMsg.from_user, TelegramMsg.text)
+                    .where(TelegramMsg.text.like('%on github%'))
+                    .where(TelegramMsg.from_user.is_not(None))
+                )
+                self_id_candidates: dict[str, str] = {}  # tg_name -> github_login
+                for from_user, text in result.all():
+                    if not text or len(text) > 150:
+                        continue
+                    m = self_id_pattern.search(text)
+                    if m:
+                        claimed = m.group(1) or m.group(2)
+                        if claimed and claimed.lower() not in (
+                            'the', 'a', 'my', 'on', 'is', 'also', 'name', 'same',
+                        ):
+                            self_id_candidates[from_user] = claimed
+
+            if self_id_candidates:
+                async with async_session() as session:
+                    result = await session.execute(select(ContributorProfile))
+                    all_profiles = {p.github_login.lower(): p for p in result.scalars().all()}
+
+                    self_linked = 0
+                    for tg_name, claimed_login in self_id_candidates.items():
+                        # Already mapped?
+                        if _normalize(tg_name) in name_to_profile:
+                            continue
+                        # Claimed username must match a real profile
+                        profile = all_profiles.get(claimed_login.lower())
+                        if profile and tg_name not in profile.display_names:
+                            if tg_name not in (profile.excluded_names or []):
+                                updated = list(profile.display_names) + [tg_name]
+                                profile.display_names = sorted(set(updated))
+                                self_linked += 1
+                                name_to_profile[_normalize(tg_name)] = profile
+
+                    await session.commit()
+                    if self_linked:
+                        print(f"  Linked {self_linked} Telegram names via self-identification messages")
+
+    except Exception as e:
+        # Telegram DB may not exist — that's fine, skip silently
+        if "no such table" not in str(e).lower():
+            print(f"  Telegram name linking skipped: {e}")
 
     return written
 

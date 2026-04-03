@@ -18,6 +18,7 @@ class ContributorProfile(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     github_login: Mapped[str] = mapped_column(String, unique=True, nullable=False)
     display_names: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    excluded_names: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
     stats: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
     first_active: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     last_active: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)

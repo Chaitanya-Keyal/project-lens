@@ -227,15 +227,29 @@ async def embed_all(rebuild: bool = False):
     # 1. Telegram thread digests
     digests = await fetch_digests("telegram_thread")
     if digests:
-        items = [{
-            "id": f"tg_{d['source_ref']}",
-            "text": d["digest_text"],
-            "metadata": {
-                "source_type": d["source_type"],
-                "source_ref": d["source_ref"],
-                "digest_type": d["digest_type"],
-            },
-        } for d in digests]
+        items = []
+        for d in digests:
+            # Extract topic and period from digest text for useful metadata
+            topic = ""
+            period = ""
+            category = ""
+            for line in d["digest_text"].split("\n"):
+                if line.startswith("Topic: "):
+                    topic = line[7:]
+                elif line.startswith("Period: "):
+                    period = line[8:]
+                elif line.startswith("Category: "):
+                    category = line[10:]
+            items.append({
+                "id": f"tg_{d['source_ref']}",
+                "text": d["digest_text"],
+                "metadata": {
+                    "source_type": "telegram_thread",
+                    "topic": topic,
+                    "period": period,
+                    "category": category,
+                },
+            })
         total_embedded += embed_collection(client, ef, "telegram_threads", items, rebuild)
     else:
         print("  telegram_threads: no digests to embed")
@@ -270,9 +284,17 @@ async def show_stats():
 
 
 async def search(query: str, n_results: int = 5):
-    """Search across all collections."""
+    """Hybrid search: embedding similarity + keyword relevance boost.
+
+    The keyword component is weighted by 1/keyword_hit_count — rare terms
+    get a strong boost (each hit is highly specific), common terms get
+    negligible boost (keyword matching adds no ranking value).
+    """
     client = get_chroma_client()
     ef = get_embedding_function()
+
+    # Extract search terms for keyword matching (lowercase, split on spaces)
+    query_terms = [t.lower() for t in query.split() if len(t) >= 3]
 
     for name in ["telegram_threads", "pr_assessments"]:
         try:
@@ -280,20 +302,60 @@ async def search(query: str, n_results: int = 5):
             if collection.count() == 0:
                 continue
 
+            # Fetch a large candidate pool — keyword boost can only re-rank
+            # documents that were fetched, so we need enough candidates
+            fetch_count = min(max(n_results * 10, 50), collection.count())
             results = collection.query(
                 query_texts=[query],
-                n_results=min(n_results, collection.count()),
+                n_results=fetch_count,
+                include=["documents", "metadatas", "distances"],
             )
 
-            print(f"\n=== {name} ({collection.count()} docs) ===")
-            for i, (doc, meta, dist) in enumerate(zip(
+            # Count keyword hits across ALL documents in the collection
+            # to determine how specific each term is
+            all_docs = collection.get(include=["documents"])
+            term_doc_counts = {}
+            for term in query_terms:
+                term_doc_counts[term] = sum(
+                    1 for doc in all_docs["documents"] if term in doc.lower()
+                )
+
+            # Score each result: embedding similarity + keyword boost
+            scored = []
+            for doc, meta, dist in zip(
                 results["documents"][0],
                 results["metadatas"][0],
                 results["distances"][0],
-            )):
-                score = 1 - dist  # cosine distance → similarity
-                print(f"\n  [{i+1}] Score: {score:.3f} | {meta.get('source_ref', '?')}")
-                # Show first 300 chars of document
+            ):
+                embedding_score = 1 - dist  # cosine distance → similarity
+
+                # Keyword boost: for each query term found in this doc,
+                # add 1/total_hits_for_that_term. Rare terms boost strongly.
+                keyword_boost = 0.0
+                doc_lower = doc.lower()
+                for term in query_terms:
+                    if term in doc_lower and term_doc_counts.get(term, 0) > 0:
+                        keyword_boost += 1.0 / term_doc_counts[term]
+
+                combined = embedding_score + keyword_boost
+                scored.append((combined, embedding_score, keyword_boost, doc, meta))
+
+            # Sort by combined score, take top n
+            scored.sort(key=lambda x: -x[0])
+            top = scored[:n_results]
+
+            # Build label
+            print(f"\n=== {name} ({collection.count()} docs) ===")
+            for i, (combined, emb, kw, doc, meta) in enumerate(top):
+                if name == "telegram_threads":
+                    label = meta.get("topic", "?")
+                elif name == "pr_assessments":
+                    label = f"PR #{meta.get('pr_number', '?')} ({meta.get('repo', '?')})"
+                else:
+                    label = meta.get("source_ref", "?")
+
+                kw_indicator = f" +kw:{kw:.3f}" if kw > 0 else ""
+                print(f"\n  [{i+1}] {combined:.3f} (emb:{emb:.3f}{kw_indicator})  {label}")
                 print(f"      {doc[:300]}...")
 
         except Exception as e:
