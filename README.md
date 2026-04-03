@@ -103,11 +103,11 @@ cp .env.example .env
 # Edit .env to point PROJECT_CONFIG_DIR at your config repo (see below)
 
 # Index (see Ingestion section below for full details)
-python scripts/index_git_history.py        # clone repos, index git history
-python scripts/github_scan.py              # fetch PRs, issues, reviews from GitHub API
-python scripts/extract_contributors.py     # derive contributor profiles + activity tiers
-./scripts/run_batch_assess.sh              # AI assessment of all PRs
-python scripts/embed_digests.py            # embed into ChromaDB for semantic search
+python scripts/github/ingest/index_git_history.py     # clone repos, index git history
+python scripts/github/ingest/github_scan.py           # fetch PRs, issues, reviews from GitHub API
+python scripts/github/process/extract_contributors.py # derive contributor profiles + activity tiers
+./scripts/github/ai_assess/batch_assess.sh            # AI assessment of all PRs
+python scripts/embed_digests.py                        # embed into ChromaDB for semantic search
 ```
 
 ## Project config
@@ -155,32 +155,32 @@ Once configured, ingestion runs in a prescribed order. Each step builds on the d
 
 ```bash
 # 1. Clone repos and index full git history (seconds, no API calls)
-python scripts/index_git_history.py
+python scripts/github/ingest/index_git_history.py
 
 # 2. Fetch all PRs, issues, and review comments from GitHub API
 #    First run fetches complete history; subsequent runs are incremental
-python scripts/github_scan.py
+python scripts/github/ingest/github_scan.py
 
 # 3. Extract contributor profiles from git + GitHub data
 #    Resolves identities across systems, computes per-dimension activity tiers
-python scripts/extract_contributors.py
+python scripts/github/process/extract_contributors.py
 
 # 4. AI assessment of every PR
 #    Currently uses Claude Code in headless mode; adaptable to other AI providers
 #    Resumable — picks up where it left off if interrupted
-./scripts/run_batch_assess.sh
+./scripts/github/ai_assess/batch_assess.sh
 
 # 5. Ingest Telegram group chat history (if applicable)
 #    Import from Telegram Desktop JSON export, then run bot for ongoing messages
-python scripts/telegram_ingest.py --import-json /path/to/result.json
+python scripts/telegram/ingest/telegram_ingest.py --import-json /path/to/result.json
 
 # 6. AI digestion of Telegram discussions
 #    One batch per invocation; loop script handles iteration
-./scripts/run_telegram_digest.sh
+./scripts/telegram/ai_assess/telegram_digest.sh
 
 # 7. Test coverage at each PR's initial submission and merge point
 #    Only for repos with a pytest-based test suite
-python scripts/calculate_coverage.py
+python scripts/github/process/calculate_coverage.py
 
 # 8. Embed all digested content into ChromaDB for semantic search
 #    Incremental — only embeds new or changed content using content hashing

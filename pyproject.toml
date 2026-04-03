@@ -10,6 +10,7 @@ dependencies = [
     "httpx>=0.28",
     "pyyaml>=6.0",
     "python-telegram-bot>=21.0",
+    "chromadb>=0.4",
 ]
 
 [project.optional-dependencies]
@@ -19,7 +20,7 @@ dev = [
 ]
 
 [tool.setuptools.packages.find]
-include = ["backend*"]
+where = ["src"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

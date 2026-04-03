@@ -23,11 +23,11 @@ from pathlib import Path
 
 from sqlalchemy import select, func
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from backend.config import settings
-from backend.database import async_session
-from backend.models import AIDigest, PRAssessment
+from project_lens.settings import settings
+from project_lens.database import async_session
+from project_lens.models import AIDigest, PRAssessment
 
 
 # ---------------------------------------------------------------------------

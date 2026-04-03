@@ -17,10 +17,10 @@ from pathlib import Path
 
 from sqlalchemy import select
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from backend.database import engine, async_session
-from backend.models import Base, ContributorProfile
+from project_lens.database import engine, async_session
+from project_lens.models import Base, ContributorProfile
 
 
 async def link(github_login: str, name: str, remove: bool = False):
