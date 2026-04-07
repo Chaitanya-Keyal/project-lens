@@ -8,7 +8,7 @@ to skip unchanged digests — only new or modified content gets embedded.
 Collections:
   - telegram_threads: discussion thread summaries from Telegram digestion
   - pr_assessments: PR assessment summaries + recommendations
-  (more to come: github_issues, contributors, etc.)
+  - issue_assessments: issue assessment summaries + recommendations
 
 Usage:
     python scripts/embed_digests.py                # embed all new/changed digests

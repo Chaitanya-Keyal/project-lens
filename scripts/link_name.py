@@ -6,8 +6,8 @@ can't determine — e.g., linking a Telegram display name to a
 GitHub login when there's no overlapping name or PR link evidence.
 
 Usage:
-    python scripts/link_name.py --github jdlcdl --name "Jean Do"
-    python scripts/link_name.py --github jdlcdl --name "Jean Do" --remove
+    python scripts/link_name.py --github kaylee --name "Kaylee Frye"
+    python scripts/link_name.py --github kaylee --name "Kaylee Frye" --remove
     python scripts/link_name.py --list                # show all profiles with names
 """
 import asyncio

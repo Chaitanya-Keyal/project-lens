@@ -206,12 +206,16 @@ python scripts/telegram/ingest/telegram_ingest.py --import-json /path/to/result.
 #    One batch per invocation; loop script handles iteration
 ./scripts/telegram/ai_assess/telegram_digest.sh
 
-# 8. Test coverage at each PR's initial submission and merge point
+# 8. Link Telegram threads to GitHub PRs/issues (manual, optional)
+#    Produces results for review — not included in automated pipelines
+./scripts/telegram/ai_assess/link_threads.sh
+
+# 9. Test coverage at each PR's initial submission and merge point
 #    Only for repos with a pytest-based test suite
 python scripts/github/process/calculate_coverage.py
 
-# 9. Embed all digested content into ChromaDB for semantic search
-#    Incremental — only embeds new or changed content using content hashing
+# 10. Embed all digested content into ChromaDB for semantic search
+#     Incremental — only embeds new or changed content using content hashing
 python scripts/embed_digests.py
 ```
 
@@ -229,9 +233,11 @@ Each dimension is scored as high/moderate/low/none based on the project's own di
 
 **Steps 6-7** handle Telegram group chat ingestion. Step 6 imports historical messages from a Telegram Desktop JSON export into a separate database (so chat data can be selectively shared independent of GitHub data). Step 7 runs an AI analysis that processes messages in weekly batches, extracting substantive discussion threads and discarding noise — one batch per `claude -p` invocation for fresh context each time, with the loop script handling iteration. The AI uses the contributor profiles from step 3 to understand who the key participants are. For ongoing ingestion, the Telegram bot can run in polling mode (`--poll`) to capture new messages in real time.
 
-**Step 8** is optional — only applicable to repos with pytest-based test suites.
+**Step 8** links Telegram thread digests to the GitHub PRs and issues they reference. This is a manual step — the AI proposes links for review before writing them. Not included in the automated pipelines.
 
-**Step 9** embeds all AI-digested content into ChromaDB for semantic search. This includes PR assessment summaries, issue assessment summaries, and Telegram thread digests. The embedding script uses content hashing to detect changes — new items get added, modified items get re-embedded, and unchanged items are skipped. Uses `BAAI/bge-large-en-v1.5` on GPU if available. ChromaDB storage lives alongside the main database in the config repo's `var/chroma/` directory.
+**Step 9** is optional — only applicable to repos with pytest-based test suites.
+
+**Step 10** embeds all AI-digested content into ChromaDB for semantic search. This includes PR assessment summaries, issue assessment summaries, and Telegram thread digests. The embedding script uses content hashing to detect changes — new items get added, modified items get re-embedded, and unchanged items are skipped. Uses `BAAI/bge-large-en-v1.5` on GPU if available. ChromaDB storage lives alongside the main database in the config repo's `var/chroma/` directory.
 
 All steps are incremental and idempotent, so they can be run on a schedule to keep the index current as the project evolves.
 
@@ -239,7 +245,7 @@ All steps are incremental and idempotent, so they can be run on a schedule to ke
 
 Two pipeline scripts orchestrate the individual steps into end-to-end runs, suitable for cron scheduling. Both take the config directory as an argument and log to `<config-dir>/var/logs/`.
 
-**GitHub pipeline** — runs steps 1-5 + 9 in order:
+**GitHub pipeline** — runs steps 1-5 + 10 in order:
 
 ```bash
 ./scripts/pipelines/github-pipeline.sh /path/to/your-project-config
@@ -247,7 +253,7 @@ Two pipeline scripts orchestrate the individual steps into end-to-end runs, suit
 
 Pulls new commits, fetches new PRs/issues from the GitHub API, rebuilds contributor profiles, runs AI assessment on anything new, and updates embeddings. Uses `set -e` — if any step fails, the pipeline stops immediately rather than running downstream steps on incomplete data.
 
-**Telegram pipeline** — runs steps 7 + 9:
+**Telegram pipeline** — runs steps 7 + 10:
 
 ```bash
 ./scripts/pipelines/telegram-pipeline.sh /path/to/your-project-config
@@ -298,6 +304,56 @@ Project Lens uses two SQLite databases. The main database holds GitHub data, ass
 Collections use cosine similarity with `BAAI/bge-large-en-v1.5` embeddings and hybrid search (embedding similarity + inverse-frequency keyword boost). Content hashing ensures only changed documents are re-embedded on each run.
 
 Contributor roles and expertise are not manually assigned — they emerge from analysis of the indexed data.
+
+## Python API
+
+Project Lens exposes a Python API for building applications on top of the indexed data. Import `LensClient`, point it at your config directory, and query everything — search, PRs, issues, contributor identity.
+
+```python
+from project_lens import LensClient
+
+lens = LensClient(config_dir="/path/to/your-project-config")
+
+# Semantic search across all embedded content (PRs, issues, Telegram)
+results = await lens.search("camera driver timeout")
+results = await lens.search("camera", collections=["issue_assessments"])
+
+# PR data
+open_prs = await lens.get_open_prs_with_assessments()
+detail = await lens.get_pr_detail("myorg/myrepo", 787)
+
+# Issue data
+open_issues = await lens.get_open_issues_with_assessments()
+detail = await lens.get_issue_detail("myorg/myrepo", 123)
+
+# Contributor identity
+profiles = await lens.list_contributor_profiles()
+github_map = await lens.resolve_display_names(["Kaylee Frye", "Malcolm Reynolds"])
+
+# Related context for a detail page
+related = await lens.search_related("screensaver disable during transcription")
+
+await lens.close()
+```
+
+The API returns dataclasses (`PRWithAssessment`, `PRDetail`, `IssueWithAssessment`, `IssueDetail`, `SearchResult`, etc.) designed for direct use in templates and UI rendering. All database access is async (SQLAlchemy async sessions); ChromaDB calls are run in threads.
+
+## Utility scripts
+
+**`scripts/link_name.py`** — manually link display names to contributor profiles when automated extraction can't resolve the mapping (e.g., Telegram display name → GitHub login):
+
+```bash
+python scripts/link_name.py --github kaylee --name "Kaylee Frye"
+python scripts/link_name.py --github kaylee --name "Kaylee Frye" --remove
+python scripts/link_name.py --list
+```
+
+**`scripts/github/ai_assess/reassess_open_prs.py`** — delete assessments for open PRs so the next batch run regenerates them with updated prompt logic. Closed/merged PR assessments are left untouched:
+
+```bash
+python scripts/github/ai_assess/reassess_open_prs.py --dry-run
+python scripts/github/ai_assess/reassess_open_prs.py
+```
 
 ## Planned
 
