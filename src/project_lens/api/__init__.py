@@ -9,7 +9,7 @@ Usage:
     results = await lens.search("raqm", collections=["telegram_threads"])
 
     # Identity
-    github_map = await lens.resolve_display_names(["Jean Do", "Seed Signer"])
+    github_map = await lens.resolve_display_names(["Kaylee Frye", "Malcolm Reynolds"])
 
     # Document retrieval
     thread = await lens.get_document("telegram_threads", "tg_chat_123/thread_1")
@@ -25,6 +25,11 @@ from pathlib import Path
 
 from project_lens.api.config import LensConfig
 from project_lens.api.identity import ContributorProfile, IdentityService
+from project_lens.api.issues import (
+    IssueDetail,
+    IssueService,
+    IssueWithAssessment,
+)
 from project_lens.api.prs import (
     ContributorActivity,
     PRDetail,
@@ -46,6 +51,7 @@ class LensClient:
         self._search = SearchService(self._config)
         self._identity = IdentityService(self._config)
         self._prs = PRService(self._config)
+        self._issues = IssueService(self._config)
 
     # --- Search ---
 
@@ -119,6 +125,22 @@ class LensClient:
         """All contributors with activity stats."""
         return await self._prs.discover_contributors()
 
+    # --- Issue Data ---
+
+    async def get_open_issues_with_assessments(self) -> list[IssueWithAssessment]:
+        """All open issues joined with assessments, ordered by tier DESC."""
+        return await self._issues.get_open_issues_with_assessments()
+
+    async def get_issue_detail(self, repo: str, number: int) -> IssueDetail | None:
+        """Full issue detail with all assessment fields and raw comment data."""
+        return await self._issues.get_issue_detail(repo, number)
+
+    async def get_issue_titles(
+        self, keys: list[tuple[str, int]],
+    ) -> dict[tuple[str, int], str]:
+        """Batch lookup of issue titles by (repo, number) pairs."""
+        return await self._issues.get_issue_titles(keys)
+
     # --- Lifecycle ---
 
     async def close(self):
@@ -133,4 +155,6 @@ __all__ = [
     "ContributorActivity",
     "PRWithAssessment",
     "PRDetail",
+    "IssueWithAssessment",
+    "IssueDetail",
 ]

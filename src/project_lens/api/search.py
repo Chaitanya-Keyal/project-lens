@@ -9,6 +9,7 @@ from project_lens.api.config import LensConfig
 COLLECTION_SOURCE_TYPES = {
     "pr_assessments": "pr_assessment",
     "telegram_threads": "telegram_thread",
+    "issue_assessments": "issue_assessment",
 }
 
 ALL_COLLECTIONS = list(COLLECTION_SOURCE_TYPES.keys())
