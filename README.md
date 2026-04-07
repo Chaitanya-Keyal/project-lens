@@ -102,13 +102,8 @@ pip install -e .
 cp .env.example .env
 # Edit .env: set DEFAULT_CONFIG_DIR=/path/to/your-project-config
 
-# Index (see Ingestion section below for full details)
-python scripts/github/ingest/index_git_history.py     # clone repos, index git history
-python scripts/github/ingest/github_scan.py           # fetch PRs, issues, reviews, comments from GitHub API
-python scripts/github/process/extract_contributors.py # derive contributor profiles + activity tiers
-./scripts/github/ai_assess/batch_assess.sh            # AI assessment of all PRs
-./scripts/github/ai_assess/batch_assess_issues.sh     # AI assessment of all issues
-python scripts/embed_digests.py                        # embed into ChromaDB for semantic search
+# Run the full GitHub pipeline (or run individual steps — see Ingestion below)
+./scripts/pipelines/github-pipeline.sh /path/to/your-project-config
 ```
 
 ## Project config
@@ -159,6 +154,11 @@ GITHUB_TOKEN=ghp_...
 ```
 
 Set `GITHUB_TOKEN` for authenticated API access (5,000 req/hr vs 60 unauthenticated). All other settings have sensible defaults derived from the config directory.
+
+Project Lens finds the config directory via (in priority order):
+1. `--config-dir /path/to/config` command-line argument
+2. `PROJECT_CONFIG_DIR` environment variable (used by the pipeline scripts)
+3. `DEFAULT_CONFIG_DIR` in the tool repo's `.env` (dev convenience)
 
 The resulting directory structure after indexing:
 
@@ -233,7 +233,41 @@ Each dimension is scored as high/moderate/low/none based on the project's own di
 
 **Step 9** embeds all AI-digested content into ChromaDB for semantic search. This includes PR assessment summaries, issue assessment summaries, and Telegram thread digests. The embedding script uses content hashing to detect changes — new items get added, modified items get re-embedded, and unchanged items are skipped. Uses `BAAI/bge-large-en-v1.5` on GPU if available. ChromaDB storage lives alongside the main database in the config repo's `var/chroma/` directory.
 
-All steps are incremental and idempotent, so they can be run on a cron schedule to keep the index current as the project evolves. A typical cron cycle runs all nine steps in sequence — each one only processes what's new or changed since the last run.
+All steps are incremental and idempotent, so they can be run on a schedule to keep the index current as the project evolves.
+
+## Pipelines
+
+Two pipeline scripts orchestrate the individual steps into end-to-end runs, suitable for cron scheduling. Both take the config directory as an argument and log to `<config-dir>/var/logs/`.
+
+**GitHub pipeline** — runs steps 1-5 + 9 in order:
+
+```bash
+./scripts/pipelines/github-pipeline.sh /path/to/your-project-config
+```
+
+Pulls new commits, fetches new PRs/issues from the GitHub API, rebuilds contributor profiles, runs AI assessment on anything new, and updates embeddings. Uses `set -e` — if any step fails, the pipeline stops immediately rather than running downstream steps on incomplete data.
+
+**Telegram pipeline** — runs steps 7 + 9:
+
+```bash
+./scripts/pipelines/telegram-pipeline.sh /path/to/your-project-config
+```
+
+Processes accumulated Telegram messages into weekly thread digests and updates embeddings. Only processes weeks that have fully closed — the current in-progress week is skipped to avoid analyzing an incomplete batch.
+
+### Scheduling
+
+Both pipelines pass the config directory via the `PROJECT_CONFIG_DIR` environment variable, which all scripts pick up automatically. Example crontab:
+
+```
+# Project Lens (MyProject): GitHub scan + AI assessment — every day at 2:00 AM
+0 2 * * * /path/to/project-lens/scripts/pipelines/github-pipeline.sh /path/to/myproject-config
+
+# Project Lens (MyProject): Telegram digest — every Friday at 4:00 AM
+0 4 * * 5 /path/to/project-lens/scripts/pipelines/telegram-pipeline.sh /path/to/myproject-config
+```
+
+The pipeline scripts handle PATH setup for cron environments and activate the Python venv internally.
 
 ## What's in the database
 

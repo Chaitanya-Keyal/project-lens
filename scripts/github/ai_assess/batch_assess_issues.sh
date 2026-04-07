@@ -13,43 +13,36 @@ source .venv/bin/activate
 
 mkdir -p var
 
+prompt_file=$(mktemp /tmp/batch_assess_issues_prompt.XXXXXX.md)
+trap "rm -f $prompt_file" EXIT
+
 batch_count=0
 
 while true; do
-    # Check if there are unassessed issues remaining
-    remaining=$(PYTHONPATH=src DEBUG=false python -c "
-import asyncio
-from project_lens.database import async_session
-from project_lens.models import GithubIssue, IssueAssessment
-from sqlalchemy import select
+    prefetch=$(PYTHONPATH=src DEBUG=false python scripts/github/ai_assess/fetch_unassessed_issues.py 2>&1) || {
+        echo "Fetch failed: $prefetch"
+        exit 1
+    }
 
-async def check():
-    async with async_session() as s:
-        assessed = await s.execute(select(IssueAssessment.repo, IssueAssessment.issue_number))
-        assessed_set = {(r[0], r[1]) for r in assessed.all()}
-        result = await s.execute(
-            select(GithubIssue)
-            .where(GithubIssue.detail_fetched_at.is_not(None))
-        )
-        issues = [i for i in result.scalars().all() if (i.repo, i.number) not in assessed_set]
-        print(len(issues))
-
-asyncio.run(check())
-")
-
-    if [ "$remaining" = "0" ]; then
+    if echo "$prefetch" | head -1 | grep -q "ALL_ASSESSED"; then
         echo "$(date): All issues assessed after $batch_count batches." >> var/batch_assess_issues.log
         echo "All issues assessed after $batch_count batches."
         break
     fi
 
     batch_count=$((batch_count + 1))
-    echo "$(date): Starting batch $batch_count ($remaining issues remaining)" >> var/batch_assess_issues.log
+    echo "$(date): Starting batch $batch_count" >> var/batch_assess_issues.log
 
-    claude -p \
+    # Build prompt: template + prefetched data
+    cat scripts/github/ai_assess/batch_assess_issues_prompt.md > "$prompt_file"
+    echo "" >> "$prompt_file"
+    echo "## Prefetched Data" >> "$prompt_file"
+    echo "" >> "$prompt_file"
+    echo "$prefetch" >> "$prompt_file"
+
+    cat "$prompt_file" | claude -p \
       --permission-mode bypassPermissions \
       --max-turns 50 \
-      "$(cat scripts/github/ai_assess/batch_assess_issues_prompt.md)" \
       >> var/batch_assess_issues.log 2>&1 || true
 
     echo "$(date): Batch $batch_count complete" >> var/batch_assess_issues.log

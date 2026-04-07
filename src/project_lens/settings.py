@@ -10,12 +10,18 @@ def _find_config_dir() -> Path | None:
 
     Priority:
       1. --config-dir command line argument
-      2. DEFAULT_CONFIG_DIR from .env in tool repo (dev convenience)
+      2. PROJECT_CONFIG_DIR environment variable
+      3. DEFAULT_CONFIG_DIR from .env in tool repo (dev convenience)
     """
     # Check command line: --config-dir /path/to/config
     for i, arg in enumerate(sys.argv):
         if arg == "--config-dir" and i + 1 < len(sys.argv):
             return Path(sys.argv[i + 1])
+
+    # Check environment variable
+    env_val = os.environ.get("PROJECT_CONFIG_DIR")
+    if env_val:
+        return Path(env_val)
 
     # Check for dev default in tool repo .env
     tool_env = Path(__file__).resolve().parent.parent.parent / ".env"

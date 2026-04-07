@@ -1,112 +1,17 @@
 You are running as an unattended batch job for the project-lens indexer. Your task is to generate PR assessments for PRs that don't have them yet.
 
-## Setup
-Working directory: /home/kdmukai/dev/tools/project-lens
-Python venv: source .venv/bin/activate
+## Prefetched data
 
-## Step 0: Load contributor and project context
-
-Run this to get contributor profiles and merge authorities from the database. Use this context when assessing reviews, merge readiness, and participant contributions.
-
-```bash
-source .venv/bin/activate && PYTHONPATH=src DEBUG=false python -c "
-import asyncio, json
-from project_lens.database import async_session
-from project_lens.models import ContributorProfile, ProjectConfigEntry
-from sqlalchemy import select
-
-async def show():
-    async with async_session() as s:
-        # Contributor profiles
-        result = await s.execute(
-            select(ContributorProfile)
-            .order_by(ContributorProfile.last_active.desc())
-        )
-        print('=== Contributor Profiles ===')
-        for p in result.scalars():
-            s_ = p.stats
-            total = s_.get('merge_commits',0) + s_.get('prs_merged',0) + s_.get('total_review_engagement',0)
-            if total < 5:
-                continue
-            mt = s_.get('merge_tier', 'none')
-            pt = s_.get('pr_tier', 'none')
-            rt = s_.get('review_tier', 'none')
-            print(f'{p.github_login} — merges:{mt} shipped:{pt} reviews:{rt} — {s_.get(\"merge_commits\",0)} merges, {s_.get(\"prs_merged\",0)} PRs merged, {s_.get(\"total_review_engagement\",0)} review engagements')
-
-        # Merge authorities from project config
-        result = await s.execute(
-            select(ProjectConfigEntry).where(ProjectConfigEntry.key == 'merge_authorities')
-        )
-        entry = result.scalar_one_or_none()
-        if entry:
-            print()
-            print('=== Merge Authorities ===')
-            for ma in entry.value:
-                print(f'{ma[\"login\"]} — scope: {ma[\"scope\"]} — {ma.get(\"description\", \"\")}')
-
-asyncio.run(show())
-"
-```
+Below under "Prefetched Data" you will find:
+- **Contributor profiles** with tier scores (merge, shipped, review) and **merge authorities**
+- **A batch of unassessed PRs** with their review data, review comments, and issue comments
 
 Use the tier scores to weight reviews and assess merge readiness:
 - Contributors with **high** merge tier are merge authorities — their ACK carries the most weight.
 - Contributors with **high** or **moderate** review tier are experienced reviewers — their substantive review satisfies the "trusted review" prerequisite for merge readiness.
 - Contributors with only **low** or **none** tiers are newer participants — their reviews are still valuable but don't alone satisfy merge readiness requirements.
 
-## Step 1: Find unassessed PRs
-Run this to get the next batch of unassessed PRs with their review data:
-
-```bash
-source .venv/bin/activate && PYTHONPATH=src DEBUG=false python -c "
-import asyncio, json
-from project_lens.database import async_session
-from project_lens.models import GithubPR, PRAssessment
-from sqlalchemy import select
-
-async def dump():
-    async with async_session() as s:
-        assessed = await s.execute(select(PRAssessment.repo, PRAssessment.pr_number))
-        assessed_set = {(r[0], r[1]) for r in assessed.all()}
-
-        result = await s.execute(
-            select(GithubPR)
-            .where(GithubPR.detail_fetched_at.is_not(None))
-            .order_by(GithubPR.repo, GithubPR.number.desc())
-        )
-        prs = [p for p in result.scalars().all() if (p.repo, p.number) not in assessed_set]
-
-        # Take next batch of 30
-        batch = prs[:30]
-        print(f'Unassessed PRs remaining: {len(prs)}')
-        print(f'Processing batch of {len(batch)}')
-        print()
-
-        for pr in batch:
-            reviews = pr.reviews_json or []
-            review_comments = pr.review_comments_json or []
-            issue_comments = pr.issue_comments_json or []
-            print(f'--- {pr.repo} PR #{pr.number}: {pr.title} ---')
-            print(f'Author: {pr.author} | State: {pr.state} | Labels: {pr.labels}')
-            if pr.merged_at_gh: print(f'Merged: {str(pr.merged_at_gh)[:10]}')
-            if pr.closed_at_gh and not pr.merged_at_gh: print(f'Closed: {str(pr.closed_at_gh)[:10]}')
-            print(f'Body: {(pr.body or \"\")[:400]}')
-            print(f'Reviews ({len(reviews)}):')
-            for r in reviews:
-                print(f'  [{r.get(\"submitted_at\",\"?\")[:10]}] {r[\"user\"][\"login\"]}: {r[\"state\"]} - {(r.get(\"body\") or \"\")[:200]}')
-            print(f'Review comments ({len(review_comments)}):')
-            for c in review_comments:
-                print(f'  [{c.get(\"created_at\",\"?\")[:10]}] {c[\"user\"][\"login\"]}: {(c.get(\"body\") or \"\")[:200]}')
-            print(f'Issue comments ({len(issue_comments)}):')
-            for c in issue_comments:
-                print(f'  [{c.get(\"created_at\",\"?\")[:10]}] {c[\"user\"][\"login\"]}: {(c.get(\"body\") or \"\")[:200]}')
-
-            print()
-
-asyncio.run(dump())
-"
-```
-
-## Step 2: Generate assessments
+## Generate assessments
 
 For each PR, fill in this exact JSON skeleton. Do not add, remove, or rename any fields.
 
@@ -178,7 +83,7 @@ hardware_tested, security_review, feature_implementation, responsive_to_feedback
 - `tier`: integer 0-3.
 - `complexity`: one of `trivial`, `low`, `medium`, `high`.
 - `risk`: one of `low`, `medium`, `high`.
-- `merge_target`: GitHub login of a merge authority from Step 0, or `"blocked"`.
+- `merge_target`: GitHub login of a merge authority from the prefetched data, or `"blocked"`.
 - `merge_readiness`: one of `not_ready`, `possibly_ready`, `merge_ready`.
 - `stale_reason`: one of `neglected`, `indecisive`, `soft_rejected`, or `null`.
 - `reviewer_sentiment`: array of objects with `reviewer` (string), `sentiment` (single word, no spaces), `needs` (string).
@@ -216,7 +121,7 @@ Closed/merged PRs only need the core assessment fields (tier, complexity, risk, 
 - **not_ready**: No ACK from a reviewer with high or moderate review tier on a non-trivial PR, or substantial unresolved review threads. Most PRs are not_ready — that's normal.
 - **possibly_ready**: Has substantive ACK(s) from reviewer(s) with high/moderate review tier, but the PR's complexity or risk warrants review from a merge authority (high merge tier). The prerequisite is at least one substantive review from an established reviewer — an ACK from a low/none-tier contributor or a drive-by LGTM doesn't qualify.
 - **merge_ready**: ACKs from established reviewers, CI presumably passing, review threads resolved. Conservative threshold — if there's doubt, use possibly_ready.
-- merge_target should reflect which merge authority should handle based on their scope (from the Merge Authorities list in Step 0).
+- merge_target should reflect which merge authority should handle based on their scope (from the Merge Authorities list in the prefetched data).
 
 ### Reviewer sentiment guidelines
 - Characterize each reviewer's current stance in one word (supportive, skeptical, neutral, concerned, satisfied, redirecting, etc.)
@@ -228,17 +133,19 @@ Closed/merged PRs only need the core assessment fields (tier, complexity, risk, 
 - **soft_rejected**: Minimal engagement from maintainers on a PR from a contributor who isn't well-known.
 - **null**: PR is actively progressing or recently active.
 
-## Step 3: Write assessments to DB
+## Write assessments to DB
 
 Write the batch as a JSON array to a temp file, then run:
 
 ```bash
-source .venv/bin/activate && PYTHONPATH=src DEBUG=false python scripts/github/ai_assess/write_assessment.py --file /tmp/pr_batch_assessments.json
+PYTHONPATH=src DEBUG=false python scripts/github/ai_assess/write_assessment.py --file /tmp/pr_batch_assessments.json
 ```
 
 The write script validates the JSON schema before writing. If it prints validation errors, read each error, fix the JSON file accordingly, and re-run the write script. Repeat until it succeeds.
 
-## Step 4: Report and exit
+Do NOT prefix commands with `source .venv/bin/activate` — the venv is already active.
+
+## Report and exit
 
 After writing, report what was processed and exit. The outer loop script will relaunch with a fresh context for the next batch.
 

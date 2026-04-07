@@ -114,6 +114,19 @@ def classify_message_type(msg: dict) -> str:
     return "text"
 
 
+def normalize_chat_id(chat_id: int) -> int:
+    """Strip the -100 supergroup prefix from Telegram chat IDs.
+
+    The Bot API prefixes supergroup chat IDs with -100 (e.g., -1001829170082),
+    while the Desktop export uses the bare ID (e.g., 1829170082). Normalize to
+    the bare form for consistent storage.
+    """
+    s = str(chat_id)
+    if s.startswith("-100"):
+        return int(s[4:])
+    return chat_id
+
+
 def parse_from_id(from_id_str: str | None) -> int | None:
     """Extract numeric user ID from Telegram export's from_id field.
 
@@ -295,8 +308,9 @@ async def poll():
         if not msg:
             return
 
-        # Only ingest from the configured chat
-        if msg.chat_id != target_chat_id:
+        # Only ingest from the configured chat (normalize both sides —
+        # the bot sees -100-prefixed supergroup IDs, config may have either form)
+        if normalize_chat_id(msg.chat_id) != normalize_chat_id(target_chat_id):
             return
 
         user = msg.from_user
@@ -319,7 +333,7 @@ async def poll():
             msg_type = "text"
 
         telegram_msg = TelegramMsg(
-            chat_id=msg.chat_id,
+            chat_id=normalize_chat_id(msg.chat_id),
             message_id=msg.message_id,
             from_user_id=user.id if user else None,
             from_user=user.full_name if user else None,
@@ -333,10 +347,12 @@ async def poll():
 
         try:
             async with tg_session() as session:
-                # Check for duplicate (bot might receive same update twice)
+                # Check for duplicate (bot might receive same update twice,
+                # or message may already exist from a JSON import)
+                normalized_cid = normalize_chat_id(msg.chat_id)
                 result = await session.execute(
                     select(TelegramMsg.id).where(
-                        TelegramMsg.chat_id == msg.chat_id,
+                        TelegramMsg.chat_id == normalized_cid,
                         TelegramMsg.message_id == msg.message_id,
                     )
                 )

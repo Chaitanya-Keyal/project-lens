@@ -9,31 +9,34 @@ set -e
 cd "$(dirname "$0")/../../.."
 source .venv/bin/activate
 
+prompt_file=$(mktemp /tmp/telegram_digest_prompt.XXXXXX.md)
+trap "rm -f $prompt_file" EXIT
+
 batch_count=0
 
 while true; do
-    # Check if there's anything left to process
-    remaining=$(PYTHONPATH=src DEBUG=false python -c "
-import asyncio
-from sqlalchemy import select, func
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
-from project_lens.settings import settings
-from project_lens.models import TelegramMsg
-tg_engine = create_async_engine(settings.telegram_db_url)
-tg_session = async_sessionmaker(tg_engine, class_=AsyncSession, expire_on_commit=False)
-async def check():
-    async with tg_session() as s:
-        r = await s.execute(select(func.count(TelegramMsg.id)).where(TelegramMsg.is_processed == False))
-        print(r.scalar())
-asyncio.run(check())
-")
+    prefetch=$(PYTHONPATH=src DEBUG=false python scripts/telegram/ai_assess/fetch_unprocessed_messages.py 2>&1) || {
+        echo "Fetch failed: $prefetch"
+        exit 1
+    }
 
-    if [ "$remaining" = "0" ]; then
+    if echo "$prefetch" | head -1 | grep -q "ALL_PROCESSED"; then
         echo "All messages processed after $batch_count batches."
         break
     fi
 
     batch_count=$((batch_count + 1))
-    echo "=== Batch $batch_count ($remaining messages remaining) ==="
-    claude -p "$(cat scripts/telegram/ai_assess/telegram_digest_prompt.md)" || true
+    echo "=== Batch $batch_count ==="
+
+    # Build prompt: template + prefetched data
+    cat scripts/telegram/ai_assess/telegram_digest_prompt.md > "$prompt_file"
+    echo "" >> "$prompt_file"
+    echo "## Prefetched Data" >> "$prompt_file"
+    echo "" >> "$prompt_file"
+    echo "$prefetch" >> "$prompt_file"
+
+    cat "$prompt_file" | claude -p \
+      --permission-mode bypassPermissions \
+      --max-turns 20 \
+      || true
 done

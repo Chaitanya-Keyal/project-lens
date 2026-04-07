@@ -1,104 +1,17 @@
 You are running as an unattended batch job for the project-lens indexer. Your task is to generate issue assessments for GitHub issues that don't have them yet.
 
-## Setup
-Working directory: /home/kdmukai/dev/tools/project-lens
-Python venv: source .venv/bin/activate
+## Prefetched data
 
-## Step 0: Load contributor and project context
-
-Run this to get contributor profiles and merge authorities from the database. Use this context when assessing whether comments carry weight.
-
-```bash
-source .venv/bin/activate && PYTHONPATH=src DEBUG=false python -c "
-import asyncio, json
-from project_lens.database import async_session
-from project_lens.models import ContributorProfile, ProjectConfigEntry
-from sqlalchemy import select
-
-async def show():
-    async with async_session() as s:
-        # Contributor profiles
-        result = await s.execute(
-            select(ContributorProfile)
-            .order_by(ContributorProfile.last_active.desc())
-        )
-        print('=== Contributor Profiles ===')
-        for p in result.scalars():
-            s_ = p.stats
-            total = s_.get('merge_commits',0) + s_.get('prs_merged',0) + s_.get('total_review_engagement',0)
-            if total < 5:
-                continue
-            mt = s_.get('merge_tier', 'none')
-            pt = s_.get('pr_tier', 'none')
-            rt = s_.get('review_tier', 'none')
-            print(f'{p.github_login} — merges:{mt} shipped:{pt} reviews:{rt} — {s_.get(\"merge_commits\",0)} merges, {s_.get(\"prs_merged\",0)} PRs merged, {s_.get(\"total_review_engagement\",0)} review engagements')
-
-        # Merge authorities from project config
-        result = await s.execute(
-            select(ProjectConfigEntry).where(ProjectConfigEntry.key == 'merge_authorities')
-        )
-        entry = result.scalar_one_or_none()
-        if entry:
-            print()
-            print('=== Merge Authorities ===')
-            for ma in entry.value:
-                print(f'{ma[\"login\"]} — scope: {ma[\"scope\"]} — {ma.get(\"description\", \"\")}')
-
-asyncio.run(show())
-"
-```
+Below under "Prefetched Data" you will find:
+- **Contributor profiles** with tier scores (merge, shipped, review) and **merge authorities**
+- **A batch of unassessed issues** with their comment data
 
 Use the tier scores to weight comments:
 - Contributors with **high** merge tier are core maintainers — their statements on an issue carry the most weight.
 - Contributors with **high** or **moderate** review/PR tier are established contributors — their technical opinions are credible.
 - Other participants may raise valid points, but their comments alone don't constitute project direction.
 
-## Step 1: Find unassessed issues
-
-Run this to get the next batch of unassessed issues with their comment data:
-
-```bash
-source .venv/bin/activate && PYTHONPATH=src DEBUG=false python -c "
-import asyncio, json
-from project_lens.database import async_session
-from project_lens.models import GithubIssue, IssueAssessment
-from sqlalchemy import select
-
-async def dump():
-    async with async_session() as s:
-        assessed = await s.execute(select(IssueAssessment.repo, IssueAssessment.issue_number))
-        assessed_set = {(r[0], r[1]) for r in assessed.all()}
-
-        result = await s.execute(
-            select(GithubIssue)
-            .where(GithubIssue.detail_fetched_at.is_not(None))
-            .order_by(GithubIssue.repo, GithubIssue.number.desc())
-        )
-        issues = [i for i in result.scalars().all() if (i.repo, i.number) not in assessed_set]
-
-        # Take next batch of 30
-        batch = issues[:30]
-        print(f'Unassessed issues remaining: {len(issues)}')
-        print(f'Processing batch of {len(batch)}')
-        print()
-
-        for issue in batch:
-            comments = issue.comments_json or []
-            print(f'--- {issue.repo} Issue #{issue.number}: {issue.title} ---')
-            print(f'Author: {issue.author} | State: {issue.state} | Labels: {issue.labels}')
-            print(f'Created: {str(issue.created_at_gh)[:10]}')
-            if issue.closed_at_gh: print(f'Closed: {str(issue.closed_at_gh)[:10]}')
-            print(f'Body: {(issue.body or \"\")[:500]}')
-            print(f'Comments ({len(comments)}):')
-            for c in comments:
-                print(f'  [{c.get(\"created_at\",\"?\")[:10]}] {c[\"user\"][\"login\"]} ({c.get(\"author_association\", \"?\")}): {(c.get(\"body\") or \"\")[:300]}')
-            print()
-
-asyncio.run(dump())
-"
-```
-
-## Step 2: Generate assessments
+## Generate assessments
 
 For each issue, fill in this exact JSON skeleton. Do not add, remove, or rename any fields.
 
@@ -194,17 +107,19 @@ Unlike PR assessments (which track toward a merge decision), issue assessments c
 
 **labels_suggested:** Suggest what labels should be on this issue based on its content. Use common GitHub label conventions (bug, enhancement, question, documentation, good first issue, etc.). This is a recommendation, not a reflection of current labels.
 
-## Step 3: Write assessments to DB
+## Write assessments to DB
 
 Write the batch as a JSON array to a temp file, then run:
 
 ```bash
-source .venv/bin/activate && PYTHONPATH=src DEBUG=false python scripts/github/ai_assess/write_issue_assessment.py --file /tmp/issue_batch_assessments.json
+PYTHONPATH=src DEBUG=false python scripts/github/ai_assess/write_issue_assessment.py --file /tmp/issue_batch_assessments.json
 ```
 
 The write script validates the JSON schema before writing. If it prints validation errors, read each error, fix the JSON file accordingly, and re-run the write script. Repeat until it succeeds.
 
-## Step 4: Report and exit
+Do NOT prefix commands with `source .venv/bin/activate` — the venv is already active.
+
+## Report and exit
 
 After writing, report what was processed and exit. The outer loop script will relaunch with a fresh context for the next batch.
 
