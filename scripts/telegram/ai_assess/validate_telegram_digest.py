@@ -14,8 +14,8 @@ from pathlib import Path
 
 REQUIRED_TOP_KEYS = {"batch_start", "batch_end", "chat_id", "threads", "processed_message_ids", "stats"}
 
-REQUIRED_THREAD_KEYS = {"topic", "category", "summary", "participants", "pr_references",
-                        "issue_references", "key_points", "message_ids"}
+REQUIRED_THREAD_KEYS = {"topic", "category", "first_message_id", "summary", "participants",
+                        "pr_references", "issue_references", "key_points", "message_ids"}
 OPTIONAL_THREAD_KEYS = {"per_person_takes"}
 
 VALID_CATEGORIES = {"pr_linked", "security", "architecture", "ecosystem", "process", "roadmap"}
@@ -107,12 +107,19 @@ def validate(data: dict) -> list[str]:
         if not isinstance(kps, list):
             errors.append(f"{prefix}.key_points must be an array")
 
-        # message_ids — array of ints
+        # message_ids ��� array of ints
         mids = thread.get("message_ids")
         if not isinstance(mids, list):
             errors.append(f"{prefix}.message_ids must be an array")
         elif mids and not isinstance(mids[0], int):
             errors.append(f"{prefix}.message_ids must contain integers")
+
+        # first_message_id — integer, must be in message_ids
+        fmid = thread.get("first_message_id")
+        if fmid is not None and not isinstance(fmid, int):
+            errors.append(f"{prefix}.first_message_id must be an integer, got {type(fmid).__name__}")
+        elif isinstance(fmid, int) and isinstance(mids, list) and fmid not in mids:
+            errors.append(f"{prefix}.first_message_id {fmid} not in message_ids")
 
         # pr_references, issue_references — arrays of strings
         for ref_key in ("pr_references", "issue_references"):

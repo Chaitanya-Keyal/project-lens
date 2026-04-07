@@ -118,17 +118,24 @@ async def write_batch(batch: dict):
                 "output_tokens": None,
             }
 
+            first_message_id = thread.get("first_message_id")
+
             if existing:
                 for k, v in digest_fields.items():
                     setattr(existing, k, v)
+                if first_message_id is not None:
+                    existing.first_message_id = first_message_id
                 existing.updated_at = now
             else:
-                session.add(AIDigest(
+                digest = AIDigest(
                     source_type="telegram_thread",
                     source_ref=source_ref,
                     digest_type="summary",
                     **digest_fields,
-                ))
+                )
+                if first_message_id is not None:
+                    digest.first_message_id = first_message_id
+                session.add(digest)
 
         await session.commit()
 

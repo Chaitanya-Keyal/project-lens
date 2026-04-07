@@ -200,6 +200,7 @@ Fill in this exact JSON skeleton for each batch. Do not add, remove, or rename a
     {
       "topic": "Short descriptive title",
       "category": "pr_linked|security|architecture|ecosystem|process|roadmap",
+      "first_message_id": 100,
       "summary": "Narrative summary naming participants. Self-contained for embedding.",
       "participants": ["Display Name", "Display Name"],
       "pr_references": ["Owner/Repo#123"],
@@ -226,6 +227,7 @@ Fill in this exact JSON skeleton for each batch. Do not add, remove, or rename a
 - `per_person_takes`: array of `{"person": str, "gist": str}` objects. Not a dict. Optional — omit the key entirely for threads where individual positions aren't interesting.
 - `stats` values: all integers.
 - `category`: exactly one of `pr_linked`, `security`, `architecture`, `ecosystem`, `process`, `roadmap`.
+- `first_message_id`: integer — the `message_id` of the message that initiated this thread discussion. Must be one of the IDs in `message_ids`. This is the message that raised the topic, not a reply or reaction.
 - `message_ids`: array of integers — only the messages that contributed to this thread.
 - `participants`: array of strings — use Telegram display names as they appear in messages.
 
