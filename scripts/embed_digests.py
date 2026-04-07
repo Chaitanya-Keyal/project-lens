@@ -27,7 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from project_lens.settings import settings
 from project_lens.database import async_session
-from project_lens.models import AIDigest, PRAssessment
+from project_lens.models import AIDigest, PRAssessment, IssueAssessment
 
 
 # ---------------------------------------------------------------------------
@@ -79,6 +79,7 @@ def get_collection(client, name: str, ef):
 COLLECTION_MAP = {
     "telegram_thread": "telegram_threads",
     "github_pr": "pr_assessments",
+    "github_issue": "issue_assessments",
 }
 
 
@@ -102,6 +103,7 @@ async def fetch_digests(source_type: str | None = None) -> list[dict]:
             "digest_type": d.digest_type,
             "content_hash": d.content_hash,
             "digest_text": d.digest_text,
+            "first_message_id": d.first_message_id,
         } for d in digests]
 
 
@@ -147,6 +149,50 @@ async def fetch_pr_assessment_texts() -> list[dict]:
                     "tier": a.tier or 0,
                     "complexity": a.complexity or "",
                     "state": a.merge_readiness or "",
+                },
+            })
+        return texts
+
+
+async def fetch_issue_assessment_texts() -> list[dict]:
+    """Fetch issue assessment summaries for embedding.
+
+    Combines summary + recommendation + discussion positions + category
+    into an embeddable text block per issue.
+    """
+    async with async_session() as session:
+        result = await session.execute(
+            select(IssueAssessment).order_by(IssueAssessment.repo, IssueAssessment.issue_number)
+        )
+        assessments = result.scalars().all()
+
+        texts = []
+        for a in assessments:
+            parts = [
+                f"Issue #{a.issue_number} ({a.repo})",
+                f"Tier: {a.tier}, Category: {a.category}, Complexity: {a.complexity}, Impact: {a.impact}",
+                f"State: {a.discussion_state}",
+            ]
+            if a.summary:
+                parts.append(a.summary)
+            if a.recommendation:
+                parts.append(a.recommendation)
+            if a.discussion_positions:
+                for dp in a.discussion_positions:
+                    if isinstance(dp, dict) and dp.get("position"):
+                        parts.append(f"{dp['user']}: {dp['position']}")
+
+            texts.append({
+                "id": f"issue_{a.repo}_{a.issue_number}",
+                "source_ref": f"{a.repo}#{a.issue_number}",
+                "text": "\n".join(parts),
+                "metadata": {
+                    "source_type": "issue_assessment",
+                    "repo": a.repo,
+                    "issue_number": a.issue_number,
+                    "tier": a.tier or 0,
+                    "category": a.category or "",
+                    "discussion_state": a.discussion_state or "",
                 },
             })
         return texts
@@ -240,15 +286,18 @@ async def embed_all(rebuild: bool = False):
                     period = line[8:]
                 elif line.startswith("Category: "):
                     category = line[10:]
+            metadata = {
+                "source_type": "telegram_thread",
+                "topic": topic,
+                "period": period,
+                "category": category,
+            }
+            if d.get("first_message_id"):
+                metadata["first_message_id"] = d["first_message_id"]
             items.append({
                 "id": f"tg_{d['source_ref']}",
                 "text": d["digest_text"],
-                "metadata": {
-                    "source_type": "telegram_thread",
-                    "topic": topic,
-                    "period": period,
-                    "category": category,
-                },
+                "metadata": metadata,
             })
         total_embedded += embed_collection(client, ef, "telegram_threads", items, rebuild)
     else:
@@ -260,6 +309,13 @@ async def embed_all(rebuild: bool = False):
         total_embedded += embed_collection(client, ef, "pr_assessments", pr_items, rebuild)
     else:
         print("  pr_assessments: no assessments to embed")
+
+    # 3. Issue assessments (directly from issue_assessments table)
+    issue_items = await fetch_issue_assessment_texts()
+    if issue_items:
+        total_embedded += embed_collection(client, ef, "issue_assessments", issue_items, rebuild)
+    else:
+        print("  issue_assessments: no assessments to embed")
 
     elapsed = time.time() - start
     print(f"\nDone in {elapsed:.1f}s. Embedded {total_embedded} new documents.")
@@ -274,7 +330,7 @@ async def show_stats():
     print(f"Embedding model: {settings.embedding_model}")
     print()
 
-    for name in ["telegram_threads", "pr_assessments"]:
+    for name in ["telegram_threads", "pr_assessments", "issue_assessments"]:
         try:
             collection = get_collection(client, name, ef)
             count = collection.count()
@@ -296,7 +352,7 @@ async def search(query: str, n_results: int = 5):
     # Extract search terms for keyword matching (lowercase, split on spaces)
     query_terms = [t.lower() for t in query.split() if len(t) >= 3]
 
-    for name in ["telegram_threads", "pr_assessments"]:
+    for name in ["telegram_threads", "pr_assessments", "issue_assessments"]:
         try:
             collection = get_collection(client, name, ef)
             if collection.count() == 0:
@@ -351,6 +407,8 @@ async def search(query: str, n_results: int = 5):
                     label = meta.get("topic", "?")
                 elif name == "pr_assessments":
                     label = f"PR #{meta.get('pr_number', '?')} ({meta.get('repo', '?')})"
+                elif name == "issue_assessments":
+                    label = f"Issue #{meta.get('issue_number', '?')} ({meta.get('repo', '?')})"
                 else:
                     label = meta.get("source_ref", "?")
 

@@ -22,4 +22,7 @@ class GithubIssue(Base):
     created_at_gh: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     updated_at_gh: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     closed_at_gh: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # Comment data fetched separately (one API call per issue)
+    comments_json: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    detail_fetched_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     last_synced: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())

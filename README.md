@@ -12,11 +12,11 @@ Project Lens provides the enriched foundation; you build the experience on top.
 
 You point Project Lens at a set of GitHub repos via a simple YAML config. It clones them locally and indexes the full git history — every commit, every contributor, every file touched. Then it fetches the complete PR and issue history from the GitHub API, including all review comments and discussion threads.
 
-That gives you the raw data. The next step is where it gets interesting: an AI analysis pass processes each PR and produces a structured assessment — not just metadata like "3 reviews, 200 lines changed" but a narrative of what happened, who contributed what, whether the review process improved the result, what design principles emerged, and how different items relate to each other. A PR with 30 review comments becomes a concise story: "kdmukai guided a new contributor through an architectural redesign, jdlcdl's testing found a derivation path bug, the final implementation was substantially better than what was originally submitted."
+That gives you the raw data. The next step is where it gets interesting: an AI analysis pass processes each PR and issue and produces structured assessments — not just metadata like "3 reviews, 200 lines changed" but a narrative of what happened, who contributed what, whether the review process improved the result, what design principles emerged, and how different items relate to each other. A PR with 30 review comments becomes a concise story: "kdmukai guided a new contributor through an architectural redesign, jdlcdl's testing found a derivation path bug, the final implementation was substantially better than what was originally submitted." An issue with a long discussion thread gets an honest characterization of where things stand — who weighed in, what positions they took, whether anything was decided, and whether the conversation simply fizzled out.
 
 All of this lands in a single SQLite database. The raw data is preserved alongside the AI-generated assessments, and content hashing ensures unchanged data is never re-analyzed. The result is a complete, queryable snapshot of a project's development history — structured for AI consumption but also useful for direct SQL queries.
 
-The next layer will embed all of this digested content into a vector database for semantic search — finding related PRs, surfacing relevant past discussions, and building contributor expertise profiles. The AI assessments are cached independently from the embeddings, so re-embedding with a different model or chunking strategy never requires re-running the expensive analysis step.
+All digested content is then embedded into a vector database (ChromaDB) for semantic search — finding related PRs and issues, surfacing relevant past discussions across data sources, and connecting threads of work that span GitHub and Telegram. The AI assessments are cached independently from the embeddings, so re-embedding with a different model or chunking strategy never requires re-running the expensive analysis step.
 
 Project Lens is generic — the engine knows nothing about any specific project. All project-specific configuration (which repos, secrets, the database itself) lives in a separate config repo. You can run multiple instances for different projects from the same codebase.
 
@@ -104,9 +104,10 @@ cp .env.example .env
 
 # Index (see Ingestion section below for full details)
 python scripts/github/ingest/index_git_history.py     # clone repos, index git history
-python scripts/github/ingest/github_scan.py           # fetch PRs, issues, reviews from GitHub API
+python scripts/github/ingest/github_scan.py           # fetch PRs, issues, reviews, comments from GitHub API
 python scripts/github/process/extract_contributors.py # derive contributor profiles + activity tiers
 ./scripts/github/ai_assess/batch_assess.sh            # AI assessment of all PRs
+./scripts/github/ai_assess/batch_assess_issues.sh     # AI assessment of all issues
 python scripts/embed_digests.py                        # embed into ChromaDB for semantic search
 ```
 
@@ -180,7 +181,7 @@ Once configured, ingestion runs in a prescribed order. Each step builds on the d
 # 1. Clone repos and index full git history (seconds, no API calls)
 python scripts/github/ingest/index_git_history.py
 
-# 2. Fetch all PRs, issues, and review comments from GitHub API
+# 2. Fetch all PRs, issues, reviews, and comments from GitHub API
 #    First run fetches complete history; subsequent runs are incremental
 python scripts/github/ingest/github_scan.py
 
@@ -193,19 +194,23 @@ python scripts/github/process/extract_contributors.py
 #    Resumable — picks up where it left off if interrupted
 ./scripts/github/ai_assess/batch_assess.sh
 
-# 5. Ingest Telegram group chat history (if applicable)
+# 5. AI assessment of every issue
+#    Same pattern as PR assessment — batched, resumable
+./scripts/github/ai_assess/batch_assess_issues.sh
+
+# 6. Ingest Telegram group chat history (if applicable)
 #    Import from Telegram Desktop JSON export, then run bot for ongoing messages
 python scripts/telegram/ingest/telegram_ingest.py --import-json /path/to/result.json
 
-# 6. AI digestion of Telegram discussions
+# 7. AI digestion of Telegram discussions
 #    One batch per invocation; loop script handles iteration
 ./scripts/telegram/ai_assess/telegram_digest.sh
 
-# 7. Test coverage at each PR's initial submission and merge point
+# 8. Test coverage at each PR's initial submission and merge point
 #    Only for repos with a pytest-based test suite
 python scripts/github/process/calculate_coverage.py
 
-# 8. Embed all digested content into ChromaDB for semantic search
+# 9. Embed all digested content into ChromaDB for semantic search
 #    Incremental — only embeds new or changed content using content hashing
 python scripts/embed_digests.py
 ```
@@ -220,15 +225,15 @@ python scripts/embed_digests.py
 
 Each dimension is scored as high/moderate/low/none based on the project's own distribution (mean + 1 standard deviation thresholds). This produces contributor profiles that downstream AI steps (PR assessments, Telegram digestion) use to understand who the key people are and what roles they play — without any manual configuration.
 
-**Step 4** is the AI analysis pass — it reads stored PR data from the database, generates structured assessments, and writes them back. Each PR is committed individually, so progress is never lost.
+**Steps 4-5** are the AI analysis passes — they read stored PR and issue data from the database, generate structured assessments, and write them back. Each item is committed individually, so progress is never lost. Issue assessments follow a different schema than PR assessments, tuned for the reality that issue discussions often don't reach conclusions — the AI honestly characterizes stale discussions, notes when nobody with authority weighed in, and avoids imposing a narrative of progress where none exists.
 
-**Steps 5-6** handle Telegram group chat ingestion. Step 5 imports historical messages from a Telegram Desktop JSON export into a separate database (so chat data can be selectively shared independent of GitHub data). Step 6 runs an AI analysis that processes messages in weekly batches, extracting substantive discussion threads and discarding noise — one batch per `claude -p` invocation for fresh context each time, with the loop script handling iteration. The AI uses the contributor profiles from step 3 to understand who the key participants are. For ongoing ingestion, the Telegram bot can run in polling mode (`--poll`) to capture new messages in real time.
+**Steps 6-7** handle Telegram group chat ingestion. Step 6 imports historical messages from a Telegram Desktop JSON export into a separate database (so chat data can be selectively shared independent of GitHub data). Step 7 runs an AI analysis that processes messages in weekly batches, extracting substantive discussion threads and discarding noise — one batch per `claude -p` invocation for fresh context each time, with the loop script handling iteration. The AI uses the contributor profiles from step 3 to understand who the key participants are. For ongoing ingestion, the Telegram bot can run in polling mode (`--poll`) to capture new messages in real time.
 
-**Step 7** is optional — only applicable to repos with pytest-based test suites.
+**Step 8** is optional — only applicable to repos with pytest-based test suites.
 
-**Step 8** embeds all AI-digested content into ChromaDB for semantic search. This includes PR assessment summaries and Telegram thread digests. The embedding script uses content hashing to detect changes — new items get added, modified items get re-embedded, and unchanged items are skipped. Uses `all-MiniLM-L6-v2` on GPU if available. ChromaDB storage lives alongside the main database in the config repo's `var/chroma/` directory.
+**Step 9** embeds all AI-digested content into ChromaDB for semantic search. This includes PR assessment summaries, issue assessment summaries, and Telegram thread digests. The embedding script uses content hashing to detect changes — new items get added, modified items get re-embedded, and unchanged items are skipped. Uses `BAAI/bge-large-en-v1.5` on GPU if available. ChromaDB storage lives alongside the main database in the config repo's `var/chroma/` directory.
 
-All steps are incremental and idempotent, so they can be run on a cron schedule to keep the index current as the project evolves. A typical cron cycle runs all eight steps in sequence — each one only processes what's new or changed since the last run.
+All steps are incremental and idempotent, so they can be run on a cron schedule to keep the index current as the project evolves. A typical cron cycle runs all nine steps in sequence — each one only processes what's new or changed since the last run.
 
 ## What's in the database
 
@@ -238,10 +243,11 @@ Project Lens uses two SQLite databases. The main database holds GitHub data, ass
 
 - **git_commits** — full commit history from local clones (authors, file changes, insertions/deletions)
 - **github_prs** — PR metadata, bodies, review comments, issue comments (complete API data as JSON)
-- **github_issues** — issue metadata and bodies
+- **github_issues** — issue metadata, bodies, and comment threads (complete API data as JSON, open and closed)
 - **contributor_profiles** — data-derived profiles per contributor: GitHub login, display names seen across systems, activity stats, and per-dimension tier scores (merge authority, shipped code, review engagement)
 - **pr_assessments** — AI-generated analysis per PR: tier, complexity, risk, narrative summary, per-participant contributions, lessons learned, outcome assessment, cross-references to related PRs/issues, test coverage evolution from initial submission to merge. For open PRs: per-person pending actions (what's on each participant's plate), merge readiness classification (not_ready/possibly_ready/merge_ready), per-reviewer sentiment, and staleness detection.
-- **ai_digests** — cached AI outputs with content hashes, so unchanged data is never re-analyzed. Includes PR assessment digests and Telegram thread summaries.
+- **issue_assessments** — AI-generated analysis per issue: tier, category (bug/feature_request/question/discussion/task/support), complexity, impact, narrative summary, discussion state (active/stale/resolved/wont_fix/duplicate), stale reason when applicable, per-participant contributions, discussion positions capturing each participant's stance, cross-references to related PRs and issues, and suggested labels. Designed for the reality that issue discussions often don't reach conclusions — honestly characterizes when discussions fizzled out or went nowhere.
+- **ai_digests** — cached AI outputs with content hashes, so unchanged data is never re-analyzed. Includes PR assessment digests, issue assessment digests, and Telegram thread summaries.
 - **project_config** — governance settings (merge authorities) synced from the project config YAML on each scan
 - **analysis_runs** — when each scan or indexing job ran
 
@@ -253,8 +259,9 @@ Project Lens uses two SQLite databases. The main database holds GitHub data, ass
 
 - **telegram_threads** — embedded thread summaries from Telegram digestion, searchable by topic and content
 - **pr_assessments** — embedded PR assessment summaries, searchable by what the PR did, who was involved, and what was learned
+- **issue_assessments** — embedded issue assessment summaries, searchable by topic, discussion state, and participant positions
 
-Collections use cosine similarity with `all-MiniLM-L6-v2` embeddings. Content hashing ensures only changed documents are re-embedded on each run.
+Collections use cosine similarity with `BAAI/bge-large-en-v1.5` embeddings and hybrid search (embedding similarity + inverse-frequency keyword boost). Content hashing ensures only changed documents are re-embedded on each run.
 
 Contributor roles and expertise are not manually assigned — they emerge from analysis of the indexed data.
 

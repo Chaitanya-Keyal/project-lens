@@ -139,19 +139,20 @@ async def fetch_all_prs(client: httpx.AsyncClient, limiter: RateLimiter, owner: 
 
 
 async def fetch_all_issues(client: httpx.AsyncClient, limiter: RateLimiter, owner: str, name: str) -> list[dict]:
-    """Fetch all open issues (excluding PRs)."""
+    """Fetch ALL issues (open + closed), excluding PRs."""
     all_issues = []
     page = 1
     while True:
         data = await api_get(client, limiter,
             f"{GITHUB_API}/repos/{owner}/{name}/issues",
-            {"state": "open", "sort": "updated", "direction": "desc", "per_page": 100, "page": page},
+            {"state": "all", "sort": "updated", "direction": "desc", "per_page": 100, "page": page},
         )
         if not data:
             break
         for item in data:
             if "pull_request" not in item:
                 all_issues.append(item)
+        print(f"    Issues page {page}: {len(data)} items (total issues so far: {len(all_issues)})")
         if len(data) < 100:
             break
         page += 1
@@ -308,6 +309,71 @@ async def backfill_pr_details(client: httpx.AsyncClient, limiter: RateLimiter, o
 
 
 # ---------------------------------------------------------------------------
+# Phase B (issues): Fetch issue comments, per-issue commit
+# ---------------------------------------------------------------------------
+
+async def fetch_issue_comments(client: httpx.AsyncClient, limiter: RateLimiter, owner: str, name: str, issue_number: int) -> list[dict]:
+    """Fetch all comments for a single issue."""
+    return await api_get(client, limiter,
+        f"{GITHUB_API}/repos/{owner}/{name}/issues/{issue_number}/comments",
+        {"per_page": 100},
+    )
+
+
+async def backfill_issue_details(client: httpx.AsyncClient, limiter: RateLimiter, owner: str, name: str):
+    """Fetch comments for issues that need it. Commits per-issue, fully resumable."""
+    repo = f"{owner}/{name}"
+
+    async with async_session() as session:
+        from sqlalchemy import or_
+        result = await session.execute(
+            select(GithubIssue)
+            .where(
+                GithubIssue.repo == repo,
+                or_(
+                    GithubIssue.detail_fetched_at.is_(None),
+                    GithubIssue.updated_at_gh > GithubIssue.detail_fetched_at,
+                ),
+            )
+            .order_by(GithubIssue.number.desc())
+        )
+        issues_to_fetch = result.scalars().all()
+
+    if not issues_to_fetch:
+        print(f"  All issues up to date.")
+        return 0
+
+    never_fetched = sum(1 for i in issues_to_fetch if i.detail_fetched_at is None)
+    stale = len(issues_to_fetch) - never_fetched
+    print(f"  {len(issues_to_fetch)} issues need comment data ({never_fetched} new, {stale} updated). 1 API call each.")
+
+    fetched = 0
+    for issue in issues_to_fetch:
+        try:
+            comments = await fetch_issue_comments(client, limiter, owner, name, issue.number)
+
+            async with async_session() as session:
+                result = await session.execute(
+                    select(GithubIssue).where(GithubIssue.id == issue.id)
+                )
+                db_issue = result.scalar_one()
+                db_issue.comments_json = comments
+                db_issue.detail_fetched_at = datetime.now(timezone.utc)
+                await session.commit()
+
+            fetched += 1
+            print(f"    Issue #{issue.number}: {len(comments)} comments "
+                  f"[{fetched}/{len(issues_to_fetch)}, API remaining: {limiter.remaining}]")
+
+        except httpx.HTTPStatusError as e:
+            print(f"    Issue #{issue.number}: HTTP {e.response.status_code} — skipping")
+        except Exception as e:
+            print(f"    Issue #{issue.number}: {e} — skipping")
+
+    return fetched
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -381,15 +447,18 @@ async def main():
 
                 print(f"  Phase A done: {len(prs)} PRs, {len(issues)} issues saved.")
 
-                # Phase B: Fetch detail data for PRs missing it
+                # Phase B: Fetch detail data for PRs and issues missing it
                 if not list_only:
                     print(f"  Phase B: Fetching PR detail data (reviews/comments)...")
-                    detail_count = await backfill_pr_details(client, limiter, repo.owner, repo.name)
+                    pr_detail_count = await backfill_pr_details(client, limiter, repo.owner, repo.name)
+                    print(f"  Phase B: Fetching issue comment data...")
+                    issue_detail_count = await backfill_issue_details(client, limiter, repo.owner, repo.name)
                     stats.append({
                         "repo": repo.full_name,
                         "prs_listed": len(prs),
                         "issues_listed": len(issues),
-                        "prs_detailed": detail_count,
+                        "prs_detailed": pr_detail_count,
+                        "issues_detailed": issue_detail_count,
                     })
                 else:
                     stats.append({
