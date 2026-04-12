@@ -27,7 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
 
 from project_lens.database import engine, async_session
 from project_lens.models import (
-    Base, GitCommit, GithubPR, PRAssessment, ContributorProfile, AnalysisRun,
+    Base, GitCommit, GithubPR, GithubIssue, PRAssessment, ContributorProfile, AnalysisRun,
 )
 
 
@@ -494,8 +494,36 @@ async def show_summary():
             print(f"{p.github_login:<25} {names:<20} {merges:>6} {mt:>4} {shipped:>7} {pt:>4} {engagement:>10} {rt:>4}")
 
 
+async def has_new_data() -> bool:
+    """Check if any source data changed since the last extraction."""
+    async with async_session() as session:
+        # When did we last extract?
+        result = await session.execute(
+            select(func.max(AnalysisRun.completed_at))
+            .where(AnalysisRun.run_type == "extract_contributors")
+        )
+        last_extraction = result.scalar()
+        if not last_extraction:
+            return True  # never run before
+
+        # Check if any source table has newer data
+        for model in (GitCommit, GithubPR, GithubIssue):
+            result = await session.execute(
+                select(func.max(model.last_synced))
+            )
+            max_synced = result.scalar()
+            if max_synced and max_synced > last_extraction:
+                return True
+
+    return False
+
+
 async def main():
     run_start = datetime.now(timezone.utc)
+
+    if not await has_new_data():
+        print("No new data since last extraction — skipping.")
+        return
 
     print("Extracting contributor profiles from git history and GitHub data...")
     count = await extract_profiles()
