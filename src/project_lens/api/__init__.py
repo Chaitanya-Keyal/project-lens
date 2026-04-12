@@ -170,6 +170,13 @@ class LensClient:
         """Batch lookup of issue titles by (repo, number) pairs."""
         return await self._issues.get_issue_titles(keys)
 
+    # --- Project Config ---
+
+    @property
+    def merge_authority_logins(self) -> set[str]:
+        """Lowercased GitHub logins of merge authorities from project config."""
+        return self._config.merge_authority_logins
+
     # --- Lifecycle ---
 
     async def close(self):

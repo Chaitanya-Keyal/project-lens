@@ -2,6 +2,7 @@
 
 from pathlib import Path
 
+import yaml
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 
@@ -12,6 +13,20 @@ class LensConfig:
         self.config_dir = Path(config_dir)
         if not self.config_dir.is_dir():
             raise ValueError(f"Config directory does not exist: {self.config_dir}")
+
+        # Load project config (merge authorities, repo list, etc.)
+        config_yaml = self.config_dir / "config.yaml"
+        if config_yaml.exists():
+            with open(config_yaml) as f:
+                self._project_config = yaml.safe_load(f) or {}
+        else:
+            self._project_config = {}
+
+        self.merge_authority_logins: set[str] = {
+            ma["login"].lower()
+            for ma in self._project_config.get("merge_authorities", [])
+            if "login" in ma
+        }
 
         self.var_dir = self.config_dir / "var"
         self.db_path = self.var_dir / "project-lens.db"
