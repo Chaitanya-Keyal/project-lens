@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
-"""Fetch PR and issue data from GitHub REST API (unauthenticated) and store in DB.
+"""Fetch PR and issue data from GitHub GraphQL API and store in DB.
 
-Two-phase approach:
-  Phase A (fast): List all PRs/issues, upsert metadata. ~4-5 API calls.
-  Phase B (slow): Fetch reviews + comments per PR. Committed per-PR, resumable.
+Uses GitHub's GraphQL search with date filtering to only fetch items updated
+since the last scan. Metadata and detail data (reviews, comments) are fetched
+in a single query per item type, eliminating the old REST two-phase approach.
 
-Rate limit: 60 requests/hour unauthenticated. The script tracks remaining quota
-and sleeps when necessary. Progress is saved after each PR so it can be interrupted
-and resumed without losing work.
+Nested connections that exceed a single page (>100 reviews, >100 comments, etc.)
+are automatically paginated with follow-up queries.
+
+Rate limit: GraphQL uses a point-based system (5,000 points/hour). Each query's
+actual cost is returned in the response and tracked by the rate limiter.
 
 Usage:
     python scripts/github_scan.py                        # all repos in config
     python scripts/github_scan.py SeedSigner/seedsigner  # specific repo
-    python scripts/github_scan.py --list-only             # Phase A only (metadata)
+    python scripts/github_scan.py --list-only             # metadata only (no reviews/comments)
 """
 import asyncio
 import sys
@@ -21,7 +23,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
-from sqlalchemy import select, func
+from sqlalchemy import select, func, or_
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
 
@@ -30,10 +32,17 @@ from project_lens.database import engine, async_session
 from project_lens.models import Base, GithubPR, GithubIssue, AnalysisRun, ProjectConfigEntry
 from project_lens.project_config import load_project_config
 
-GITHUB_API = "https://api.github.com"
-HEADERS = {"Accept": "application/vnd.github.v3+json"}
-if settings.github_token:
-    HEADERS["Authorization"] = f"Bearer {settings.github_token}"
+GRAPHQL_URL = "https://api.github.com/graphql"
+
+if not settings.github_token:
+    print("Error: GITHUB_TOKEN is required for GraphQL API access.")
+    print("Set it in your project .env file.")
+    sys.exit(1)
+
+HEADERS = {
+    "Authorization": f"Bearer {settings.github_token}",
+    "Content-Type": "application/json",
+}
 
 
 def parse_gh_datetime(s: str | None) -> datetime | None:
@@ -42,122 +51,517 @@ def parse_gh_datetime(s: str | None) -> datetime | None:
     return datetime.fromisoformat(s.replace("Z", "+00:00"))
 
 
-class RateLimiter:
-    """Conservative rate limiter for GitHub API.
+# ---------------------------------------------------------------------------
+# GraphQL query templates
+# ---------------------------------------------------------------------------
 
-    Even with an authenticated token (5,000 req/hr), we stay well below
-    the limit to avoid any risk of account suspension. Default: max 500
-    requests per hour (~1 every 7 seconds). This is 10% of the authenticated
-    limit — extremely conservative.
-    """
-    # Hard ceiling: never exceed this many requests per hour
-    MAX_REQUESTS_PER_HOUR = 1000
-    # Minimum seconds between requests
+# Fragment for rateLimit — included in every query
+RATE_LIMIT_FRAGMENT = "rateLimit { cost remaining resetAt }"
+
+PR_SEARCH_QUERY = """
+query($q: String!, $cursor: String) {
+  RATE_LIMIT
+  search(query: $q, type: ISSUE, first: 100, after: $cursor) {
+    pageInfo { hasNextPage endCursor }
+    nodes {
+      ... on PullRequest {
+        number title state merged mergeable
+        author { login }
+        labels(first: 20) { nodes { name } }
+        body createdAt updatedAt closedAt mergedAt
+        reviews(first: 100) {
+          pageInfo { hasNextPage endCursor }
+          nodes { author { login } state submittedAt body }
+        }
+        reviewThreads(first: 60) {
+          pageInfo { hasNextPage endCursor }
+          nodes {
+            comments(first: 20) {
+              pageInfo { hasNextPage endCursor }
+              nodes { author { login } body createdAt }
+            }
+          }
+        }
+        comments(first: 100) {
+          pageInfo { hasNextPage endCursor }
+          nodes { author { login } body createdAt }
+        }
+      }
+    }
+  }
+}
+""".replace("RATE_LIMIT", RATE_LIMIT_FRAGMENT)
+
+PR_SEARCH_LIST_ONLY_QUERY = """
+query($q: String!, $cursor: String) {
+  RATE_LIMIT
+  search(query: $q, type: ISSUE, first: 100, after: $cursor) {
+    pageInfo { hasNextPage endCursor }
+    nodes {
+      ... on PullRequest {
+        number title state merged mergeable
+        author { login }
+        labels(first: 20) { nodes { name } }
+        body createdAt updatedAt closedAt mergedAt
+      }
+    }
+  }
+}
+""".replace("RATE_LIMIT", RATE_LIMIT_FRAGMENT)
+
+ISSUE_SEARCH_QUERY = """
+query($q: String!, $cursor: String) {
+  RATE_LIMIT
+  search(query: $q, type: ISSUE, first: 100, after: $cursor) {
+    pageInfo { hasNextPage endCursor }
+    nodes {
+      ... on Issue {
+        number title state
+        author { login }
+        labels(first: 20) { nodes { name } }
+        body createdAt updatedAt closedAt
+        comments(first: 100) {
+          pageInfo { hasNextPage endCursor }
+          nodes { author { login } body createdAt }
+        }
+      }
+    }
+  }
+}
+""".replace("RATE_LIMIT", RATE_LIMIT_FRAGMENT)
+
+ISSUE_SEARCH_LIST_ONLY_QUERY = """
+query($q: String!, $cursor: String) {
+  RATE_LIMIT
+  search(query: $q, type: ISSUE, first: 100, after: $cursor) {
+    pageInfo { hasNextPage endCursor }
+    nodes {
+      ... on Issue {
+        number title state
+        author { login }
+        labels(first: 20) { nodes { name } }
+        body createdAt updatedAt closedAt
+      }
+    }
+  }
+}
+""".replace("RATE_LIMIT", RATE_LIMIT_FRAGMENT)
+
+# Follow-up queries for paginating truncated nested connections
+
+PR_REVIEWS_QUERY = """
+query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
+  RATE_LIMIT
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      reviews(first: 100, after: $cursor) {
+        pageInfo { hasNextPage endCursor }
+        nodes { author { login } state submittedAt body }
+      }
+    }
+  }
+}
+""".replace("RATE_LIMIT", RATE_LIMIT_FRAGMENT)
+
+PR_COMMENTS_QUERY = """
+query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
+  RATE_LIMIT
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      comments(first: 100, after: $cursor) {
+        pageInfo { hasNextPage endCursor }
+        nodes { author { login } body createdAt }
+      }
+    }
+  }
+}
+""".replace("RATE_LIMIT", RATE_LIMIT_FRAGMENT)
+
+PR_REVIEW_THREADS_QUERY = """
+query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
+  RATE_LIMIT
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      reviewThreads(first: 60, after: $cursor) {
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          comments(first: 20) {
+            pageInfo { hasNextPage endCursor }
+            nodes { author { login } body createdAt }
+          }
+        }
+      }
+    }
+  }
+}
+""".replace("RATE_LIMIT", RATE_LIMIT_FRAGMENT)
+
+ISSUE_COMMENTS_QUERY = """
+query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
+  RATE_LIMIT
+  repository(owner: $owner, name: $name) {
+    issue(number: $number) {
+      comments(first: 100, after: $cursor) {
+        pageInfo { hasNextPage endCursor }
+        nodes { author { login } body createdAt }
+      }
+    }
+  }
+}
+""".replace("RATE_LIMIT", RATE_LIMIT_FRAGMENT)
+
+
+# ---------------------------------------------------------------------------
+# Rate limiter (GraphQL point-based)
+# ---------------------------------------------------------------------------
+
+class RateLimiter:
+    """Rate limiter for GitHub GraphQL API (point-based, 5,000 points/hour)."""
     MIN_DELAY = 2.0
+    SAFETY_THRESHOLD = 500  # pause when remaining drops below this
 
     def __init__(self):
-        self.remaining = 60  # GitHub's reported remaining (updated from headers)
+        self.remaining = 5000
         self.reset_at = 0
         self.total_requests = 0
-        self.hour_start = time.time()
-        self.requests_this_hour = 0
+        self.total_points = 0
         self.last_request_at = 0
 
-    def update(self, resp: httpx.Response):
-        self.remaining = int(resp.headers.get("X-RateLimit-Remaining", self.remaining))
-        self.reset_at = int(resp.headers.get("X-RateLimit-Reset", self.reset_at))
+    def update(self, rate_limit_data: dict | None):
         self.total_requests += 1
-        self.requests_this_hour += 1
         self.last_request_at = time.time()
-
-        # Reset hourly counter
-        if time.time() - self.hour_start > 3600:
-            self.hour_start = time.time()
-            self.requests_this_hour = 0
+        if rate_limit_data:
+            self.remaining = rate_limit_data.get("remaining", self.remaining)
+            self.total_points += rate_limit_data.get("cost", 0)
+            reset_at = rate_limit_data.get("resetAt")
+            if reset_at:
+                self.reset_at = parse_gh_datetime(reset_at).timestamp()
 
     async def wait_if_needed(self):
-        # 1. Enforce minimum delay between requests
+        # Enforce minimum delay between requests
         elapsed = time.time() - self.last_request_at
         if elapsed < self.MIN_DELAY:
             await asyncio.sleep(self.MIN_DELAY - elapsed)
 
-        # 2. Enforce our own hourly ceiling (well below GitHub's limit)
-        if self.requests_this_hour >= self.MAX_REQUESTS_PER_HOUR:
-            wait = 3600 - (time.time() - self.hour_start) + 2
-            if wait > 0:
-                print(f"    Self-imposed hourly limit reached ({self.requests_this_hour} requests). Waiting {wait:.0f}s...")
-                await asyncio.sleep(wait)
-                self.hour_start = time.time()
-                self.requests_this_hour = 0
-
-        # 3. Respect GitHub's reported limit as a safety net
-        if self.remaining <= 5:
+        # Pause if approaching rate limit
+        if self.remaining <= self.SAFETY_THRESHOLD:
             wait = max(self.reset_at - time.time() + 2, 0)
             if wait > 0:
-                print(f"    GitHub rate limit nearly exhausted ({self.remaining} left). Waiting {wait:.0f}s...")
+                print(f"    GraphQL rate limit low ({self.remaining} points left). Waiting {wait:.0f}s until reset...")
                 await asyncio.sleep(wait)
+                self.remaining = 5000  # reset after waiting
 
 
-async def api_get(client: httpx.AsyncClient, limiter: RateLimiter, url: str, params: dict = None) -> dict | list:
-    """Make a rate-limited GET request to the GitHub API."""
+# ---------------------------------------------------------------------------
+# GraphQL API call
+# ---------------------------------------------------------------------------
+
+async def graphql_query(client: httpx.AsyncClient, limiter: RateLimiter, query: str, variables: dict) -> dict:
+    """Make a rate-limited GraphQL query. Returns the 'data' dict from the response."""
     await limiter.wait_if_needed()
-    resp = await client.get(url, params=params or {}, headers=HEADERS)
-    limiter.update(resp)
+    resp = await client.post(GRAPHQL_URL, json={"query": query, "variables": variables}, headers=HEADERS)
 
     if resp.status_code == 403:
-        # Rate limited — back off and retry once
         print(f"    403 response — backing off 60s...")
         await asyncio.sleep(60)
-        resp = await client.get(url, params=params or {}, headers=HEADERS)
-        limiter.update(resp)
+        resp = await client.post(GRAPHQL_URL, json={"query": query, "variables": variables}, headers=HEADERS)
 
     resp.raise_for_status()
-    return resp.json()
+    result = resp.json()
+
+    # Check for GraphQL-level errors
+    if "errors" in result:
+        error_msgs = [e.get("message", str(e)) for e in result["errors"]]
+        # Rate limit errors come as 200 with error messages
+        if any("rate limit" in m.lower() for m in error_msgs):
+            print(f"    GraphQL rate limit hit. Waiting 60s...")
+            await asyncio.sleep(60)
+            resp = await client.post(GRAPHQL_URL, json={"query": query, "variables": variables}, headers=HEADERS)
+            resp.raise_for_status()
+            result = resp.json()
+            if "errors" in result:
+                raise RuntimeError(f"GraphQL errors after retry: {result['errors']}")
+        else:
+            raise RuntimeError(f"GraphQL errors: {result['errors']}")
+
+    data = result.get("data", {})
+    limiter.update(data.get("rateLimit"))
+    return data
 
 
 # ---------------------------------------------------------------------------
-# Phase A: List PRs and Issues (fast, metadata only)
+# Response transformation: GraphQL -> REST-compatible format
 # ---------------------------------------------------------------------------
 
-async def fetch_all_prs(client: httpx.AsyncClient, limiter: RateLimiter, owner: str, name: str) -> list[dict]:
-    """Fetch ALL PRs (open + closed + merged), paginating through entire history."""
-    all_prs = []
+def _get_login(author: dict | None) -> str:
+    """Extract login from a GraphQL author field, handling deleted accounts."""
+    if author and author.get("login"):
+        return author["login"]
+    return "ghost"
+
+
+def transform_review(gql_review: dict) -> dict:
+    """GraphQL review node -> REST /pulls/{n}/reviews format."""
+    return {
+        "user": {"login": _get_login(gql_review.get("author"))},
+        "state": gql_review["state"],
+        "submitted_at": gql_review.get("submittedAt"),
+        "body": gql_review.get("body"),
+    }
+
+
+def transform_comment(gql_comment: dict) -> dict:
+    """GraphQL comment node -> REST /issues/{n}/comments format."""
+    return {
+        "user": {"login": _get_login(gql_comment.get("author"))},
+        "created_at": gql_comment.get("createdAt"),
+        "body": gql_comment.get("body"),
+    }
+
+
+def transform_pr_node(node: dict) -> tuple[dict, dict]:
+    """Transform a GraphQL PullRequest node into (metadata_dict, details_dict).
+
+    metadata_dict: compatible with upsert_pr()
+    details_dict: {reviews, review_comments, issue_comments} in REST format
+    """
+    labels = [n["name"] for n in node.get("labels", {}).get("nodes", [])]
+
+    # GraphQL returns mergeable as enum (MERGEABLE/CONFLICTING/UNKNOWN),
+    # REST returned boolean (true/false/null). Convert to match DB Boolean column.
+    mergeable_raw = node.get("mergeable")
+    if mergeable_raw == "MERGEABLE":
+        mergeable = True
+    elif mergeable_raw == "CONFLICTING":
+        mergeable = False
+    else:
+        mergeable = None
+
+    metadata = {
+        "number": node["number"],
+        "title": node["title"],
+        "user": {"login": _get_login(node.get("author"))},
+        "state": "closed" if node["state"] == "CLOSED" else "open",
+        "merged_at": node.get("mergedAt"),
+        "labels": [{"name": name} for name in labels],
+        "mergeable": mergeable,
+        "body": node.get("body"),
+        "created_at": node.get("createdAt"),
+        "updated_at": node.get("updatedAt"),
+        "closed_at": node.get("closedAt"),
+    }
+
+    reviews_data = node.get("reviews", {})
+    review_threads_data = node.get("reviewThreads", {})
+    comments_data = node.get("comments", {})
+
+    reviews = [transform_review(r) for r in reviews_data.get("nodes", [])]
+
+    # Flatten review thread comments into a single list
+    review_comments = []
+    for thread in review_threads_data.get("nodes", []):
+        for comment in thread.get("comments", {}).get("nodes", []):
+            review_comments.append(transform_comment(comment))
+
+    issue_comments = [transform_comment(c) for c in comments_data.get("nodes", [])]
+
+    details = {
+        "reviews": reviews,
+        "review_comments": review_comments,
+        "issue_comments": issue_comments,
+        # Carry pageInfo for pagination detection
+        "_reviews_page_info": reviews_data.get("pageInfo", {}),
+        "_review_threads_page_info": review_threads_data.get("pageInfo", {}),
+        "_review_threads_nodes": review_threads_data.get("nodes", []),
+        "_comments_page_info": comments_data.get("pageInfo", {}),
+    }
+
+    return metadata, details
+
+
+def transform_issue_node(node: dict) -> tuple[dict, dict]:
+    """Transform a GraphQL Issue node into (metadata_dict, details_dict).
+
+    metadata_dict: compatible with upsert_issue()
+    details_dict: {comments} in REST format
+    """
+    labels = [n["name"] for n in node.get("labels", {}).get("nodes", [])]
+    comments_data = node.get("comments", {})
+
+    metadata = {
+        "number": node["number"],
+        "title": node["title"],
+        "user": {"login": _get_login(node.get("author"))},
+        "state": node["state"].lower(),
+        "labels": [{"name": name} for name in labels],
+        "comments": len(comments_data.get("nodes", [])),
+        "body": node.get("body"),
+        "created_at": node.get("createdAt"),
+        "updated_at": node.get("updatedAt"),
+        "closed_at": node.get("closedAt"),
+    }
+
+    details = {
+        "comments": [transform_comment(c) for c in comments_data.get("nodes", [])],
+        "_comments_page_info": comments_data.get("pageInfo", {}),
+    }
+
+    return metadata, details
+
+
+# ---------------------------------------------------------------------------
+# Paginated search + nested pagination
+# ---------------------------------------------------------------------------
+
+async def graphql_search(client: httpx.AsyncClient, limiter: RateLimiter,
+                         owner: str, name: str, item_type: str,
+                         since: datetime | None, list_only: bool) -> list[dict]:
+    """Run a paginated GraphQL search, returning all matching nodes.
+
+    item_type: "pr" or "issue"
+    """
+    q = f"repo:{owner}/{name} is:{item_type}"
+    if since:
+        # Format as ISO date for GitHub search
+        since_str = since.strftime("%Y-%m-%dT%H:%M:%S")
+        q += f" updated:>{since_str}"
+
+    if item_type == "pr":
+        query = PR_SEARCH_LIST_ONLY_QUERY if list_only else PR_SEARCH_QUERY
+    else:
+        query = ISSUE_SEARCH_LIST_ONLY_QUERY if list_only else ISSUE_SEARCH_QUERY
+
+    all_nodes = []
+    cursor = None
     page = 1
+
     while True:
-        data = await api_get(client, limiter,
-            f"{GITHUB_API}/repos/{owner}/{name}/pulls",
-            {"state": "all", "sort": "updated", "direction": "desc", "per_page": 100, "page": page},
-        )
-        if not data:
+        variables = {"q": q}
+        if cursor:
+            variables["cursor"] = cursor
+
+        data = await graphql_query(client, limiter, query, variables)
+        search = data.get("search", {})
+        nodes = search.get("nodes", [])
+
+        # Filter out empty nodes (can happen with union types)
+        nodes = [n for n in nodes if n]
+        all_nodes.extend(nodes)
+
+        print(f"    {item_type.upper()} page {page}: {len(nodes)} items (total: {len(all_nodes)}, "
+              f"cost: {data.get('rateLimit', {}).get('cost', '?')} pts, "
+              f"remaining: {limiter.remaining} pts)")
+
+        page_info = search.get("pageInfo", {})
+        if page_info.get("hasNextPage") and page_info.get("endCursor"):
+            cursor = page_info["endCursor"]
+            page += 1
+        else:
             break
-        all_prs.extend(data)
-        print(f"    PRs page {page}: {len(data)} items (total so far: {len(all_prs)})")
-        if len(data) < 100:
-            break
-        page += 1
-    return all_prs
+
+    return all_nodes
 
 
-async def fetch_all_issues(client: httpx.AsyncClient, limiter: RateLimiter, owner: str, name: str) -> list[dict]:
-    """Fetch ALL issues (open + closed), excluding PRs."""
-    all_issues = []
-    page = 1
-    while True:
-        data = await api_get(client, limiter,
-            f"{GITHUB_API}/repos/{owner}/{name}/issues",
-            {"state": "all", "sort": "updated", "direction": "desc", "per_page": 100, "page": page},
-        )
-        if not data:
-            break
-        for item in data:
-            if "pull_request" not in item:
-                all_issues.append(item)
-        print(f"    Issues page {page}: {len(data)} items (total issues so far: {len(all_issues)})")
-        if len(data) < 100:
-            break
-        page += 1
-    return all_issues
+async def paginate_pr_nested(client: httpx.AsyncClient, limiter: RateLimiter,
+                             owner: str, name: str, pr_number: int,
+                             details: dict) -> dict:
+    """Fetch remaining pages for any truncated nested connections on a PR.
 
+    Modifies and returns the details dict with complete data.
+    """
+    # Paginate reviews
+    page_info = details.pop("_reviews_page_info", {})
+    if page_info.get("hasNextPage"):
+        print(f"      PR #{pr_number}: paginating reviews...")
+        cursor = page_info["endCursor"]
+        while True:
+            data = await graphql_query(client, limiter, PR_REVIEWS_QUERY,
+                {"owner": owner, "name": name, "number": pr_number, "cursor": cursor})
+            reviews_conn = data["repository"]["pullRequest"]["reviews"]
+            for node in reviews_conn.get("nodes", []):
+                details["reviews"].append(transform_review(node))
+            pi = reviews_conn.get("pageInfo", {})
+            if pi.get("hasNextPage") and pi.get("endCursor"):
+                cursor = pi["endCursor"]
+            else:
+                break
+
+    # Paginate review threads (and their nested comments)
+    threads_page_info = details.pop("_review_threads_page_info", {})
+    thread_nodes = details.pop("_review_threads_nodes", [])
+
+    # First, check if any existing thread had truncated comments
+    for thread in thread_nodes:
+        thread_comments_pi = thread.get("comments", {}).get("pageInfo", {})
+        if thread_comments_pi.get("hasNextPage"):
+            # Rare: a single review thread with >20 comments.
+            # We'd need the thread ID to paginate, which we don't have in the current
+            # query. Log it and accept the truncation — this is extremely uncommon.
+            print(f"      PR #{pr_number}: review thread has >20 comments (truncated)")
+
+    # Paginate to get more review threads if the connection was truncated
+    if threads_page_info.get("hasNextPage"):
+        print(f"      PR #{pr_number}: paginating review threads...")
+        cursor = threads_page_info["endCursor"]
+        while True:
+            data = await graphql_query(client, limiter, PR_REVIEW_THREADS_QUERY,
+                {"owner": owner, "name": name, "number": pr_number, "cursor": cursor})
+            threads_conn = data["repository"]["pullRequest"]["reviewThreads"]
+            for thread in threads_conn.get("nodes", []):
+                for comment in thread.get("comments", {}).get("nodes", []):
+                    details["review_comments"].append(transform_comment(comment))
+            pi = threads_conn.get("pageInfo", {})
+            if pi.get("hasNextPage") and pi.get("endCursor"):
+                cursor = pi["endCursor"]
+            else:
+                break
+
+    # Paginate issue comments (general discussion)
+    page_info = details.pop("_comments_page_info", {})
+    if page_info.get("hasNextPage"):
+        print(f"      PR #{pr_number}: paginating comments...")
+        cursor = page_info["endCursor"]
+        while True:
+            data = await graphql_query(client, limiter, PR_COMMENTS_QUERY,
+                {"owner": owner, "name": name, "number": pr_number, "cursor": cursor})
+            comments_conn = data["repository"]["pullRequest"]["comments"]
+            for node in comments_conn.get("nodes", []):
+                details["issue_comments"].append(transform_comment(node))
+            pi = comments_conn.get("pageInfo", {})
+            if pi.get("hasNextPage") and pi.get("endCursor"):
+                cursor = pi["endCursor"]
+            else:
+                break
+
+    return details
+
+
+async def paginate_issue_nested(client: httpx.AsyncClient, limiter: RateLimiter,
+                                owner: str, name: str, issue_number: int,
+                                details: dict) -> dict:
+    """Fetch remaining pages for truncated comment connections on an issue."""
+    page_info = details.pop("_comments_page_info", {})
+    if page_info.get("hasNextPage"):
+        print(f"      Issue #{issue_number}: paginating comments...")
+        cursor = page_info["endCursor"]
+        while True:
+            data = await graphql_query(client, limiter, ISSUE_COMMENTS_QUERY,
+                {"owner": owner, "name": name, "number": issue_number, "cursor": cursor})
+            comments_conn = data["repository"]["issue"]["comments"]
+            for node in comments_conn.get("nodes", []):
+                details["comments"].append(transform_comment(node))
+            pi = comments_conn.get("pageInfo", {})
+            if pi.get("hasNextPage") and pi.get("endCursor"):
+                cursor = pi["endCursor"]
+            else:
+                break
+
+    return details
+
+
+# ---------------------------------------------------------------------------
+# DB upsert functions
+# ---------------------------------------------------------------------------
 
 async def upsert_pr(session, repo: str, data: dict):
     result = await session.execute(
@@ -218,164 +622,103 @@ async def upsert_issue(session, repo: str, data: dict):
         session.add(issue)
 
 
+async def upsert_pr_details(session, repo: str, pr_number: int, details: dict):
+    """Update review/comment JSON and detail_fetched_at for a PR."""
+    result = await session.execute(
+        select(GithubPR).where(GithubPR.repo == repo, GithubPR.number == pr_number)
+    )
+    pr = result.scalar_one()
+    pr.reviews_json = details["reviews"]
+    pr.review_comments_json = details["review_comments"]
+    pr.issue_comments_json = details["issue_comments"]
+    pr.detail_fetched_at = datetime.now(timezone.utc)
+
+
+async def upsert_issue_details(session, repo: str, issue_number: int, details: dict):
+    """Update comments JSON and detail_fetched_at for an issue."""
+    result = await session.execute(
+        select(GithubIssue).where(GithubIssue.repo == repo, GithubIssue.number == issue_number)
+    )
+    issue = result.scalar_one()
+    issue.comments_json = details["comments"]
+    issue.detail_fetched_at = datetime.now(timezone.utc)
+
+
 # ---------------------------------------------------------------------------
-# Phase B: Fetch PR detail data (reviews + comments), per-PR commit
+# Since-date logic
 # ---------------------------------------------------------------------------
 
-async def fetch_pr_details(client: httpx.AsyncClient, limiter: RateLimiter, owner: str, name: str, pr_number: int) -> dict:
-    """Fetch reviews, review comments, and issue comments for a single PR."""
-    reviews = await api_get(client, limiter,
-        f"{GITHUB_API}/repos/{owner}/{name}/pulls/{pr_number}/reviews",
-        {"per_page": 100},
-    )
-    review_comments = await api_get(client, limiter,
-        f"{GITHUB_API}/repos/{owner}/{name}/pulls/{pr_number}/comments",
-        {"per_page": 100},
-    )
-    issue_comments = await api_get(client, limiter,
-        f"{GITHUB_API}/repos/{owner}/{name}/issues/{pr_number}/comments",
-        {"per_page": 100},
-    )
-    return {
-        "reviews": reviews,
-        "review_comments": review_comments,
-        "issue_comments": issue_comments,
+async def get_last_updated(repo: str) -> datetime | None:
+    """Get the most recent updated_at_gh across PRs and issues for a repo."""
+    async with async_session() as session:
+        pr_max = await session.execute(
+            select(func.max(GithubPR.updated_at_gh)).where(GithubPR.repo == repo)
+        )
+        issue_max = await session.execute(
+            select(func.max(GithubIssue.updated_at_gh)).where(GithubIssue.repo == repo)
+        )
+        dates = [d for d in [pr_max.scalar(), issue_max.scalar()] if d]
+        return max(dates) if dates else None
+
+
+# ---------------------------------------------------------------------------
+# Main scan loop
+# ---------------------------------------------------------------------------
+
+async def scan_repo(client: httpx.AsyncClient, limiter: RateLimiter,
+                    owner: str, name: str, list_only: bool) -> dict:
+    """Scan a single repo using GraphQL. Returns stats dict."""
+    repo = f"{owner}/{name}"
+    since = await get_last_updated(repo)
+
+    if since:
+        print(f"  Incremental scan: items updated since {since.isoformat()}")
+    else:
+        print(f"  Full scan: no prior data")
+
+    # Fetch PRs
+    print(f"  Fetching PRs...")
+    pr_nodes = await graphql_search(client, limiter, owner, name, "pr", since, list_only)
+
+    async with async_session() as session:
+        for node in pr_nodes:
+            metadata, details = transform_pr_node(node)
+            await upsert_pr(session, repo, metadata)
+
+            if not list_only:
+                details = await paginate_pr_nested(client, limiter, owner, name, metadata["number"], details)
+                await upsert_pr_details(session, repo, metadata["number"], details)
+
+        await session.commit()
+
+    # Fetch issues
+    print(f"  Fetching issues...")
+    issue_nodes = await graphql_search(client, limiter, owner, name, "issue", since, list_only)
+
+    async with async_session() as session:
+        for node in issue_nodes:
+            metadata, details = transform_issue_node(node)
+            await upsert_issue(session, repo, metadata)
+
+            if not list_only:
+                details = await paginate_issue_nested(client, limiter, owner, name, metadata["number"], details)
+                await upsert_issue_details(session, repo, metadata["number"], details)
+
+        await session.commit()
+
+    stats = {
+        "repo": repo,
+        "prs": len(pr_nodes),
+        "issues": len(issue_nodes),
     }
 
+    if since:
+        print(f"  Done: {len(pr_nodes)} PRs, {len(issue_nodes)} issues updated since last scan.")
+    else:
+        print(f"  Done: {len(pr_nodes)} PRs, {len(issue_nodes)} issues (full scan).")
 
-async def backfill_pr_details(client: httpx.AsyncClient, limiter: RateLimiter, owner: str, name: str):
-    """Fetch detail data for PRs that need it. Commits per-PR, fully resumable.
+    return stats
 
-    Fetches details for:
-    1. PRs that have never had details fetched (initial backfill)
-    2. PRs where GitHub activity happened after our last detail fetch (ongoing updates)
-    """
-    repo = f"{owner}/{name}"
-
-    async with async_session() as session:
-        from sqlalchemy import or_
-        result = await session.execute(
-            select(GithubPR)
-            .where(
-                GithubPR.repo == repo,
-                or_(
-                    # Never fetched
-                    GithubPR.detail_fetched_at.is_(None),
-                    # GitHub activity since our last fetch
-                    GithubPR.updated_at_gh > GithubPR.detail_fetched_at,
-                ),
-            )
-            .order_by(GithubPR.number.desc())
-        )
-        prs_to_fetch = result.scalars().all()
-
-    if not prs_to_fetch:
-        print(f"  All PRs up to date.")
-        return 0
-
-    never_fetched = sum(1 for p in prs_to_fetch if p.detail_fetched_at is None)
-    stale = len(prs_to_fetch) - never_fetched
-    print(f"  {len(prs_to_fetch)} PRs need detail data ({never_fetched} new, {stale} updated). 3 API calls each.")
-
-    fetched = 0
-    for pr in prs_to_fetch:
-        try:
-            details = await fetch_pr_details(client, limiter, owner, name, pr.number)
-
-            # Save immediately in its own session/transaction
-            async with async_session() as session:
-                result = await session.execute(
-                    select(GithubPR).where(GithubPR.id == pr.id)
-                )
-                db_pr = result.scalar_one()
-                db_pr.reviews_json = details["reviews"]
-                db_pr.review_comments_json = details["review_comments"]
-                db_pr.issue_comments_json = details["issue_comments"]
-                db_pr.detail_fetched_at = datetime.now(timezone.utc)
-                await session.commit()
-
-            fetched += 1
-            review_count = len(details["reviews"])
-            comment_count = len(details["review_comments"]) + len(details["issue_comments"])
-            print(f"    PR #{pr.number}: {review_count} reviews, {comment_count} comments "
-                  f"[{fetched}/{len(prs_to_fetch)}, API remaining: {limiter.remaining}]")
-
-        except httpx.HTTPStatusError as e:
-            print(f"    PR #{pr.number}: HTTP {e.response.status_code} — skipping")
-        except Exception as e:
-            print(f"    PR #{pr.number}: {e} — skipping")
-
-    return fetched
-
-
-# ---------------------------------------------------------------------------
-# Phase B (issues): Fetch issue comments, per-issue commit
-# ---------------------------------------------------------------------------
-
-async def fetch_issue_comments(client: httpx.AsyncClient, limiter: RateLimiter, owner: str, name: str, issue_number: int) -> list[dict]:
-    """Fetch all comments for a single issue."""
-    return await api_get(client, limiter,
-        f"{GITHUB_API}/repos/{owner}/{name}/issues/{issue_number}/comments",
-        {"per_page": 100},
-    )
-
-
-async def backfill_issue_details(client: httpx.AsyncClient, limiter: RateLimiter, owner: str, name: str):
-    """Fetch comments for issues that need it. Commits per-issue, fully resumable."""
-    repo = f"{owner}/{name}"
-
-    async with async_session() as session:
-        from sqlalchemy import or_
-        result = await session.execute(
-            select(GithubIssue)
-            .where(
-                GithubIssue.repo == repo,
-                or_(
-                    GithubIssue.detail_fetched_at.is_(None),
-                    GithubIssue.updated_at_gh > GithubIssue.detail_fetched_at,
-                ),
-            )
-            .order_by(GithubIssue.number.desc())
-        )
-        issues_to_fetch = result.scalars().all()
-
-    if not issues_to_fetch:
-        print(f"  All issues up to date.")
-        return 0
-
-    never_fetched = sum(1 for i in issues_to_fetch if i.detail_fetched_at is None)
-    stale = len(issues_to_fetch) - never_fetched
-    print(f"  {len(issues_to_fetch)} issues need comment data ({never_fetched} new, {stale} updated). 1 API call each.")
-
-    fetched = 0
-    for issue in issues_to_fetch:
-        try:
-            comments = await fetch_issue_comments(client, limiter, owner, name, issue.number)
-
-            async with async_session() as session:
-                result = await session.execute(
-                    select(GithubIssue).where(GithubIssue.id == issue.id)
-                )
-                db_issue = result.scalar_one()
-                db_issue.comments_json = comments
-                db_issue.detail_fetched_at = datetime.now(timezone.utc)
-                await session.commit()
-
-            fetched += 1
-            print(f"    Issue #{issue.number}: {len(comments)} comments "
-                  f"[{fetched}/{len(issues_to_fetch)}, API remaining: {limiter.remaining}]")
-
-        except httpx.HTTPStatusError as e:
-            print(f"    Issue #{issue.number}: HTTP {e.response.status_code} — skipping")
-        except Exception as e:
-            print(f"    Issue #{issue.number}: {e} — skipping")
-
-    return fetched
-
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
 
 async def main():
     config = load_project_config()
@@ -383,7 +726,14 @@ async def main():
     # Parse args
     list_only = "--list-only" in sys.argv
     target = None
+    skip_next = False
     for arg in sys.argv[1:]:
+        if skip_next:
+            skip_next = False
+            continue
+        if arg == "--config-dir":
+            skip_next = True
+            continue
         if not arg.startswith("-"):
             target = arg
             break
@@ -426,47 +776,15 @@ async def main():
     limiter = RateLimiter()
     stats = []
 
-    print(f"GitHub scan for {len(repos)} repo(s): {config.display_name}")
-    print(f"Mode: {'list only' if list_only else 'full (list + detail backfill)'}")
+    print(f"GitHub scan (GraphQL) for {len(repos)} repo(s): {config.display_name}")
+    print(f"Mode: {'list only' if list_only else 'full (metadata + details)'}")
 
     async with httpx.AsyncClient(timeout=30.0) as client:
         for repo in repos:
             print(f"\n  [{repo.full_name}]")
             try:
-                # Phase A: List all PRs and issues
-                print(f"  Phase A: Fetching PR/issue list...")
-                prs = await fetch_all_prs(client, limiter, repo.owner, repo.name)
-                issues = await fetch_all_issues(client, limiter, repo.owner, repo.name)
-
-                async with async_session() as session:
-                    for pr_data in prs:
-                        await upsert_pr(session, repo.full_name, pr_data)
-                    for issue_data in issues:
-                        await upsert_issue(session, repo.full_name, issue_data)
-                    await session.commit()
-
-                print(f"  Phase A done: {len(prs)} PRs, {len(issues)} issues saved.")
-
-                # Phase B: Fetch detail data for PRs and issues missing it
-                if not list_only:
-                    print(f"  Phase B: Fetching PR detail data (reviews/comments)...")
-                    pr_detail_count = await backfill_pr_details(client, limiter, repo.owner, repo.name)
-                    print(f"  Phase B: Fetching issue comment data...")
-                    issue_detail_count = await backfill_issue_details(client, limiter, repo.owner, repo.name)
-                    stats.append({
-                        "repo": repo.full_name,
-                        "prs_listed": len(prs),
-                        "issues_listed": len(issues),
-                        "prs_detailed": pr_detail_count,
-                        "issues_detailed": issue_detail_count,
-                    })
-                else:
-                    stats.append({
-                        "repo": repo.full_name,
-                        "prs_listed": len(prs),
-                        "issues_listed": len(issues),
-                    })
-
+                repo_stats = await scan_repo(client, limiter, repo.owner, repo.name, list_only)
+                stats.append(repo_stats)
             except Exception as e:
                 print(f"  Error: {e}")
                 stats.append({"repo": repo.full_name, "error": str(e)})
@@ -484,7 +802,7 @@ async def main():
         await session.commit()
 
     elapsed = datetime.now(timezone.utc) - run_start
-    print(f"\nDone in {elapsed}. {limiter.total_requests} API requests made.")
+    print(f"\nDone in {elapsed}. {limiter.total_requests} GraphQL queries, {limiter.total_points} points used.")
     for s in stats:
         print(f"  {s}")
 
