@@ -72,6 +72,8 @@ class ContributorActivity:
     """Contributor activity stats derived from profiles."""
     github_username: str
     pr_count: int
+    prs_merged: int
+    prs_open: int
     review_count: int
     comment_count: int
     last_active: datetime | None
@@ -292,6 +294,8 @@ class PRService:
                 ContributorActivity(
                     github_username=p.github_login,
                     pr_count=p.stats.get("prs_authored", 0),
+                    prs_merged=p.stats.get("prs_merged", 0),
+                    prs_open=p.stats.get("prs_open", 0),
                     review_count=p.stats.get("reviews_given", 0),
                     comment_count=(
                         p.stats.get("review_comments_given", 0)
