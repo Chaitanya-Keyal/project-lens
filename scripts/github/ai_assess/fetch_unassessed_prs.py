@@ -24,15 +24,27 @@ from fetch_contributor_context import get_contributor_context
 
 async def main():
     async with async_session() as s:
-        assessed = await s.execute(select(PRAssessment.repo, PRAssessment.pr_number))
-        assessed_set = {(r[0], r[1]) for r in assessed.all()}
+        # Map (repo, pr_number) -> assessment updated_at timestamp
+        assessed = await s.execute(
+            select(PRAssessment.repo, PRAssessment.pr_number, PRAssessment.updated_at)
+        )
+        assessment_map = {(r[0], r[1]): r[2] for r in assessed.all()}
 
         result = await s.execute(
             select(GithubPR)
             .where(GithubPR.detail_fetched_at.is_not(None))
             .order_by(GithubPR.repo, GithubPR.number.desc())
         )
-        prs = [p for p in result.scalars().all() if (p.repo, p.number) not in assessed_set]
+
+        prs = []
+        for pr in result.scalars().all():
+            key = (pr.repo, pr.number)
+            if key not in assessment_map:
+                # Never assessed
+                prs.append(pr)
+            elif pr.state == "open" and pr.detail_fetched_at > assessment_map[key]:
+                # Open PR with new activity since last assessment
+                prs.append(pr)
 
     if not prs:
         print("ALL_ASSESSED")
@@ -46,7 +58,9 @@ async def main():
     print()
 
     # PR batch data
-    print(f"Unassessed PRs remaining: {len(prs)}")
+    new_count = sum(1 for p in prs if (p.repo, p.number) not in assessment_map)
+    stale_count = len(prs) - new_count
+    print(f"PRs to assess: {len(prs)} ({new_count} new, {stale_count} updated)")
     print(f"Processing batch of {len(batch)}")
     print()
 

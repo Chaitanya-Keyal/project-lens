@@ -24,15 +24,27 @@ from fetch_contributor_context import get_contributor_context
 
 async def main():
     async with async_session() as s:
-        assessed = await s.execute(select(IssueAssessment.repo, IssueAssessment.issue_number))
-        assessed_set = {(r[0], r[1]) for r in assessed.all()}
+        # Map (repo, issue_number) -> assessment updated_at timestamp
+        assessed = await s.execute(
+            select(IssueAssessment.repo, IssueAssessment.issue_number, IssueAssessment.updated_at)
+        )
+        assessment_map = {(r[0], r[1]): r[2] for r in assessed.all()}
 
         result = await s.execute(
             select(GithubIssue)
             .where(GithubIssue.detail_fetched_at.is_not(None))
             .order_by(GithubIssue.repo, GithubIssue.number.desc())
         )
-        issues = [i for i in result.scalars().all() if (i.repo, i.number) not in assessed_set]
+
+        issues = []
+        for issue in result.scalars().all():
+            key = (issue.repo, issue.number)
+            if key not in assessment_map:
+                # Never assessed
+                issues.append(issue)
+            elif issue.state == "open" and issue.detail_fetched_at > assessment_map[key]:
+                # Open issue with new activity since last assessment
+                issues.append(issue)
 
     if not issues:
         print("ALL_ASSESSED")
@@ -46,7 +58,9 @@ async def main():
     print()
 
     # Issue batch data
-    print(f"Unassessed issues remaining: {len(issues)}")
+    new_count = sum(1 for i in issues if (i.repo, i.number) not in assessment_map)
+    stale_count = len(issues) - new_count
+    print(f"Issues to assess: {len(issues)} ({new_count} new, {stale_count} updated)")
     print(f"Processing batch of {len(batch)}")
     print()
 
