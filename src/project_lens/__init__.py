@@ -8,10 +8,12 @@ Public API re-exported from project_lens.api for convenience:
 from project_lens.api import (
     ContributorActivity,
     ContributorProfile,
+    IssueWithAssessment,
     LensClient,
     PRDetail,
     PRWithAssessment,
     SearchResult,
+    TelegramDigestSummary,
 )
 
 __all__ = [
@@ -21,4 +23,6 @@ __all__ = [
     "ContributorActivity",
     "PRWithAssessment",
     "PRDetail",
+    "IssueWithAssessment",
+    "TelegramDigestSummary",
 ]

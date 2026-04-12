@@ -21,6 +21,7 @@ Usage:
     contributors = await lens.discover_contributors()
 """
 
+from datetime import datetime
 from pathlib import Path
 
 from project_lens.api.config import LensConfig
@@ -37,7 +38,7 @@ from project_lens.api.prs import (
     PRWithAssessment,
 )
 from project_lens.api.search import SearchResult, SearchService
-from project_lens.api.telegram import TelegramService
+from project_lens.api.telegram import TelegramDigestSummary, TelegramService
 
 
 class LensClient:
@@ -113,6 +114,12 @@ class LensClient:
         """All open PRs joined with assessments, ordered by tier DESC."""
         return await self._prs.get_open_prs_with_assessments()
 
+    async def get_recently_closed_prs(
+        self, since: datetime | None = None,
+    ) -> list[PRWithAssessment]:
+        """Merged and closed PRs since a cutoff date."""
+        return await self._prs.get_recently_closed_prs(since=since)
+
     async def get_pr_detail(self, repo: str, number: int) -> PRDetail | None:
         """Full PR detail with all assessment fields and raw GitHub data."""
         return await self._prs.get_pr_detail(repo, number)
@@ -123,6 +130,12 @@ class LensClient:
         """Batch lookup of PR titles by (repo, number) pairs."""
         return await self._prs.get_pr_titles(keys)
 
+    async def get_pr_participants(
+        self, keys: list[tuple[str, int]],
+    ) -> dict[tuple[str, int], set[str]]:
+        """Batch lookup of participant usernames (author + contributors) by (repo, number) pairs."""
+        return await self._prs.get_pr_participants(keys)
+
     async def discover_contributors(self) -> list[ContributorActivity]:
         """All contributors with activity stats."""
         return await self._prs.discover_contributors()
@@ -132,6 +145,14 @@ class LensClient:
     async def list_telegram_participants(self) -> list[str]:
         """Distinct Telegram display names from message history."""
         return await self._telegram.list_participants()
+
+    async def get_recent_telegram_digests(
+        self,
+        since: datetime | None = None,
+        limit: int = 50,
+    ) -> list[TelegramDigestSummary]:
+        """Recent Telegram thread digests, ordered by most recent first."""
+        return await self._telegram.get_recent_digests(since=since, limit=limit)
 
     # --- Issue Data ---
 
@@ -165,4 +186,5 @@ __all__ = [
     "PRDetail",
     "IssueWithAssessment",
     "IssueDetail",
+    "TelegramDigestSummary",
 ]

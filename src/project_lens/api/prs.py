@@ -3,7 +3,7 @@
 from dataclasses import dataclass, field
 from datetime import datetime
 
-from sqlalchemy import and_, or_, select
+from sqlalchemy import and_, func, or_, select
 
 from project_lens.models import ContributorProfile, GithubPR, PRAssessment
 from project_lens.api.config import LensConfig
@@ -11,7 +11,7 @@ from project_lens.api.config import LensConfig
 
 @dataclass
 class PRWithAssessment:
-    """Open PR joined with its assessment data."""
+    """PR joined with its assessment data."""
     repo: str
     number: int
     title: str
@@ -28,6 +28,8 @@ class PRWithAssessment:
     participant_contributions: list | None
     outcome: dict | None
     pending_actions: dict | None
+    merged_at: datetime | None = None
+    closed_at: datetime | None = None
 
 
 @dataclass
@@ -73,6 +75,9 @@ class ContributorActivity:
     review_count: int
     comment_count: int
     last_active: datetime | None
+    merge_tier: str = "none"
+    pr_tier: str = "none"
+    review_tier: str = "none"
 
 
 class PRService:
@@ -117,6 +122,52 @@ class PRService:
                     participant_contributions=a.participant_contributions if a else None,
                     outcome=a.outcome if a else None,
                     pending_actions=a.pending_actions if a else None,
+                )
+                for pr, a in result.all()
+            ]
+
+    async def get_recently_closed_prs(
+        self, since: datetime | None = None,
+    ) -> list[PRWithAssessment]:
+        """Merged and closed PRs since a cutoff date, ordered by event timestamp DESC."""
+        event_ts = func.coalesce(GithubPR.merged_at_gh, GithubPR.closed_at_gh)
+        filters = [GithubPR.state.in_(["merged", "closed"])]
+        if since:
+            filters.append(event_ts >= since)
+
+        async with self._config.async_session() as session:
+            result = await session.execute(
+                select(GithubPR, PRAssessment)
+                .outerjoin(
+                    PRAssessment,
+                    and_(
+                        GithubPR.repo == PRAssessment.repo,
+                        GithubPR.number == PRAssessment.pr_number,
+                    ),
+                )
+                .where(*filters)
+                .order_by(event_ts.desc())
+            )
+            return [
+                PRWithAssessment(
+                    repo=pr.repo,
+                    number=pr.number,
+                    title=pr.title,
+                    author=pr.author,
+                    state=pr.state,
+                    review_state=pr.review_state,
+                    created_at=pr.created_at_gh,
+                    updated_at=pr.updated_at_gh,
+                    tier=a.tier if a else None,
+                    complexity=a.complexity if a else None,
+                    risk=a.risk if a else None,
+                    summary=a.summary if a else None,
+                    recommendation=a.recommendation if a else None,
+                    participant_contributions=a.participant_contributions if a else None,
+                    outcome=a.outcome if a else None,
+                    pending_actions=a.pending_actions if a else None,
+                    merged_at=pr.merged_at_gh,
+                    closed_at=pr.closed_at_gh,
                 )
                 for pr, a in result.all()
             ]
@@ -189,6 +240,47 @@ class PRService:
                 (repo, number): title for repo, number, title in result.all()
             }
 
+    async def get_pr_participants(
+        self, keys: list[tuple[str, int]],
+    ) -> dict[tuple[str, int], set[str]]:
+        """Batch lookup of participant usernames (author + contributors) by (repo, number) pairs.
+
+        Returns lowercased username sets for case-insensitive matching.
+        """
+        if not keys:
+            return {}
+        async with self._config.async_session() as session:
+            conditions = [
+                and_(GithubPR.repo == repo, GithubPR.number == number)
+                for repo, number in keys
+            ]
+            result = await session.execute(
+                select(
+                    GithubPR.repo,
+                    GithubPR.number,
+                    GithubPR.author,
+                    PRAssessment.participant_contributions,
+                )
+                .outerjoin(
+                    PRAssessment,
+                    and_(
+                        GithubPR.repo == PRAssessment.repo,
+                        GithubPR.number == PRAssessment.pr_number,
+                    ),
+                )
+                .where(or_(*conditions))
+            )
+            participants: dict[tuple[str, int], set[str]] = {}
+            for repo, number, author, contribs in result.all():
+                usernames = {author.lower()}
+                if contribs:
+                    for p in contribs:
+                        un = p.get("github_username") if isinstance(p, dict) else None
+                        if un:
+                            usernames.add(un.lower())
+                participants[(repo, number)] = usernames
+            return participants
+
     async def discover_contributors(self) -> list[ContributorActivity]:
         """All contributors with activity stats, ordered by last active."""
         async with self._config.async_session() as session:
@@ -206,6 +298,9 @@ class PRService:
                         + p.stats.get("pr_comments_given", 0)
                     ),
                     last_active=p.last_active,
+                    merge_tier=p.stats.get("merge_tier", "none"),
+                    pr_tier=p.stats.get("pr_tier", "none"),
+                    review_tier=p.stats.get("review_tier", "none"),
                 )
                 for p in result.scalars()
             ]
