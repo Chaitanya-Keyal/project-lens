@@ -11,6 +11,14 @@
 
 set -e
 
+# Prevent overlapping runs (hourly cron may overlap a slow run)
+LOCK_FILE="/tmp/project-lens-github-pipeline.lock"
+exec 200>"$LOCK_FILE"
+if ! flock -n 200; then
+    echo "$(date): Pipeline already running, skipping." >> "${1:-/dev/null}/var/logs/github-pipeline.log" 2>/dev/null
+    exit 0
+fi
+
 if [ -z "$1" ]; then
     echo "Usage: $0 <config-dir>"
     echo "  config-dir: path to project config repo (contains config.yaml and var/)"
