@@ -37,6 +37,7 @@ from project_lens.api.prs import (
     PRWithAssessment,
 )
 from project_lens.api.search import SearchResult, SearchService
+from project_lens.api.telegram import TelegramService
 
 
 class LensClient:
@@ -52,6 +53,7 @@ class LensClient:
         self._identity = IdentityService(self._config)
         self._prs = PRService(self._config)
         self._issues = IssueService(self._config)
+        self._telegram = TelegramService(self._config)
 
     # --- Search ---
 
@@ -124,6 +126,12 @@ class LensClient:
     async def discover_contributors(self) -> list[ContributorActivity]:
         """All contributors with activity stats."""
         return await self._prs.discover_contributors()
+
+    # --- Telegram Data ---
+
+    async def list_telegram_participants(self) -> list[str]:
+        """Distinct Telegram display names from message history."""
+        return await self._telegram.list_participants()
 
     # --- Issue Data ---
 

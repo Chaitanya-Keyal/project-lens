@@ -43,6 +43,19 @@ class SearchService:
 
     def _get_ef(self):
         if self._ef is None:
+            gpu_url = getattr(self._config, "gpu_service_url", None)
+            if gpu_url:
+                try:
+                    from gpu_client import ServiceEmbeddingFunction
+
+                    self._ef = ServiceEmbeddingFunction(
+                        service_url=gpu_url,
+                        model_name=self._config.embedding_model,
+                    )
+                    return self._ef
+                except ImportError:
+                    pass
+
             from chromadb.utils.embedding_functions import (
                 SentenceTransformerEmbeddingFunction,
             )

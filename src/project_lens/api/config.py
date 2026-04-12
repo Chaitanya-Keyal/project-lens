@@ -18,16 +18,23 @@ class LensConfig:
         self.chroma_path = self.var_dir / "chroma"
         self.database_url = f"sqlite+aiosqlite:///{self.db_path}"
 
-        # Read embedding model from .env if present
+        # Read config from .env if present
         self.embedding_model = "BAAI/bge-large-en-v1.5"
+        self.gpu_service_url = ""
         env_path = self.config_dir / ".env"
         if env_path.exists():
             for line in env_path.read_text().splitlines():
                 line = line.strip()
-                if line.startswith("EMBEDDING_MODEL=") and not line.startswith("#"):
+                if line.startswith("#"):
+                    continue
+                if line.startswith("EMBEDDING_MODEL="):
                     val = line.split("=", 1)[1].strip().strip('"').strip("'")
                     if val:
                         self.embedding_model = val
+                elif line.startswith("GPU_SERVICE_URL="):
+                    val = line.split("=", 1)[1].strip().strip('"').strip("'")
+                    if val:
+                        self.gpu_service_url = val
 
         self.engine = create_async_engine(
             self.database_url,
@@ -37,6 +44,18 @@ class LensConfig:
             self.engine, class_=AsyncSession, expire_on_commit=False,
         )
 
+        # Telegram messages live in a separate database (sibling telegram.db)
+        self.telegram_db_path = self.var_dir / "telegram.db"
+        self.telegram_db_url = f"sqlite+aiosqlite:///{self.telegram_db_path}"
+        self.telegram_engine = create_async_engine(
+            self.telegram_db_url,
+            connect_args={"check_same_thread": False},
+        )
+        self.telegram_session = async_sessionmaker(
+            self.telegram_engine, class_=AsyncSession, expire_on_commit=False,
+        )
+
     async def close(self):
-        """Dispose the engine and release connections."""
+        """Dispose the engines and release connections."""
         await self.engine.dispose()
+        await self.telegram_engine.dispose()

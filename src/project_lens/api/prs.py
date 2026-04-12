@@ -27,6 +27,7 @@ class PRWithAssessment:
     recommendation: str | None
     participant_contributions: list | None
     outcome: dict | None
+    pending_actions: dict | None
 
 
 @dataclass
@@ -115,6 +116,7 @@ class PRService:
                     recommendation=a.recommendation if a else None,
                     participant_contributions=a.participant_contributions if a else None,
                     outcome=a.outcome if a else None,
+                    pending_actions=a.pending_actions if a else None,
                 )
                 for pr, a in result.all()
             ]

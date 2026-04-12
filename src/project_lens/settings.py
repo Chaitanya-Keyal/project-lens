@@ -58,6 +58,7 @@ class Settings(BaseSettings):
     telegram_database_url: str = ""
     embedding_model: str = "BAAI/bge-large-en-v1.5"
     chroma_dir: str = ""
+    gpu_service_url: str = ""
 
     model_config = {"env_file": _resolve_env_file(), "extra": "ignore"}
 
