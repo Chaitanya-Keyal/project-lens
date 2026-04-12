@@ -27,7 +27,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from project_lens.settings import settings
 from project_lens.database import async_session
-from project_lens.models import AIDigest, PRAssessment, IssueAssessment
+from sqlalchemy import and_
+
+from project_lens.models import AIDigest, GithubPR, PRAssessment, IssueAssessment
 
 
 # ---------------------------------------------------------------------------
@@ -41,7 +43,21 @@ def get_chroma_client():
 
 
 def get_embedding_function():
-    """Create embedding function with auto GPU detection."""
+    """Create embedding function via gpu-service (with CPU fallback)."""
+    gpu_service_url = getattr(settings, "gpu_service_url", None)
+
+    if gpu_service_url:
+        try:
+            from gpu_client import ServiceEmbeddingFunction
+
+            print(f"Using gpu-service at {gpu_service_url}")
+            return ServiceEmbeddingFunction(
+                service_url=gpu_service_url,
+                model_name=settings.embedding_model,
+            )
+        except ImportError:
+            print("gpu-client not installed, falling back to local inference")
+
     from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
 
     device = "cpu"
@@ -115,12 +131,20 @@ async def fetch_pr_assessment_texts() -> list[dict]:
     """
     async with async_session() as session:
         result = await session.execute(
-            select(PRAssessment).order_by(PRAssessment.repo, PRAssessment.pr_number)
+            select(PRAssessment, GithubPR.state)
+            .outerjoin(
+                GithubPR,
+                and_(
+                    PRAssessment.repo == GithubPR.repo,
+                    PRAssessment.pr_number == GithubPR.number,
+                ),
+            )
+            .order_by(PRAssessment.repo, PRAssessment.pr_number)
         )
-        assessments = result.scalars().all()
+        rows = result.all()
 
         texts = []
-        for a in assessments:
+        for a, github_state in rows:
             parts = [
                 f"PR #{a.pr_number} ({a.repo})",
                 f"Tier: {a.tier}, Complexity: {a.complexity}, Risk: {a.risk}",
@@ -148,7 +172,8 @@ async def fetch_pr_assessment_texts() -> list[dict]:
                     "pr_number": a.pr_number,
                     "tier": a.tier or 0,
                     "complexity": a.complexity or "",
-                    "state": a.merge_readiness or "",
+                    "merge_readiness": a.merge_readiness or "",
+                    "github_state": github_state or "",
                 },
             })
         return texts
@@ -207,13 +232,14 @@ def embed_collection(client, ef, collection_name: str, items: list[dict], rebuil
     """
     import hashlib
 
-    collection = get_collection(client, collection_name, ef)
-
     if rebuild:
-        existing = collection.get()
-        if existing["ids"]:
-            collection.delete(ids=existing["ids"])
-            print(f"  Deleted {len(existing['ids'])} existing documents")
+        try:
+            client.delete_collection(collection_name)
+            print(f"  Deleted collection {collection_name}")
+        except ValueError:
+            pass  # Collection didn't exist
+
+    collection = get_collection(client, collection_name, ef)
 
     # Add content hash to each item's metadata
     for item in items:
