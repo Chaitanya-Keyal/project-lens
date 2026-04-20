@@ -252,10 +252,14 @@ async def extract_profiles():
         #   moderate: > mean            (above average)
         #   low:      > 0              (some activity)
         #   none:     0                (no activity in this dimension)
-        # A Tukey upper-outlier fence (Q3 + 1.5*IQR) on total_activity is also
-        # computed to carve a "regular" band out of the low group. Tukey is used
-        # here because total_activity is heavily right-skewed, which makes linear
-        # mean-based lower bounds unusable (mean - stdev goes negative).
+        # Two order-statistic thresholds on total_activity are also computed:
+        #   * Q1 (lower floor)           — demotes "one-action drive-by" cases
+        #                                  to the Minimal Activity tier.
+        #   * Q3 + 1.5*IQR (upper fence) — promotes statistical outliers above
+        #                                  the bulk into the "regular" tier.
+        # Order statistics are used instead of linear mean±stdev on this
+        # dimension because the distribution is heavily right-skewed — a
+        # linear lower bound (mean - stdev) would go negative and be useless.
         import statistics as _stats
 
         def compute_bands(values: list[int]) -> tuple[float, float]:
@@ -267,15 +271,22 @@ async def extract_profiles():
             stdev = _stats.stdev(nonzero)
             return (mean, mean + stdev)
 
-        def compute_tukey_fence(values: list[int]) -> float:
-            """Upper-outlier fence (Q3 + 1.5*IQR) over non-zero values."""
+        def compute_total_quartile_bounds(values: list[int]) -> tuple[float, float]:
+            """Return (Q1 lower floor, Q3 + 1.5*IQR upper fence) over non-zero values.
+
+            Both are full-population order-statistic cutoffs on the right-skewed
+            total_activity distribution. Q1 is the bottom-quartile threshold
+            used to demote pure drive-by activity into Minimal; the upper fence
+            is Tukey's standard outlier cutoff used to promote regular into
+            the new Notable tier.
+            """
             nonzero = sorted(v for v in values if v > 0)
             n = len(nonzero)
             if n < 4:
-                return 0.0
+                return (0.0, 0.0)
             q1 = nonzero[n // 4]
             q3 = nonzero[3 * n // 4]
-            return q3 + 1.5 * (q3 - q1)
+            return (float(q1), q3 + 1.5 * (q3 - q1))
 
         def classify(value: int, mean: float, high_threshold: float) -> str:
             if value == 0:
@@ -320,7 +331,7 @@ async def extract_profiles():
         pr_mean, pr_high = compute_bands(all_prs)
         review_mean, review_high = compute_bands(all_reviews)
         total_mean, total_high = compute_bands(all_totals)
-        total_fence = compute_tukey_fence(all_totals)
+        total_lower_floor, total_upper_fence = compute_total_quartile_bounds(all_totals)
 
         # --- Build final profiles ---
         now = datetime.now(timezone.utc)
@@ -341,15 +352,23 @@ async def extract_profiles():
             merge_tier = classify(data["merge_commits"], merge_mean, merge_high)
             pr_tier = classify(data["prs_merged"], pr_mean, pr_high)
             review_tier = classify(total_review_engagement, review_mean, review_high)
-            total_tier = classify_total(total_activity, total_fence, total_mean, total_high)
+            total_tier = classify_total(total_activity, total_upper_fence, total_mean, total_high)
 
             # group_tier: the contributor's overall PM grouping, 5-way.
-            # Single-dim specialists qualify because the max propagates any
-            # dimension's tier. The "regular" band lives on total_tier only
-            # (the per-dim tiers are 4-valued); it surfaces as group_tier when
-            # a contributor is low/none across every dimension but their total
-            # activity crosses the Tukey fence.
-            group_tier = max_tier(merge_tier, pr_tier, review_tier, total_tier)
+            # Single-dim specialists qualify via max across dimensions.
+            # A Q1 lower floor on total_activity then demotes single-action
+            # drive-bys (e.g., one comment and nothing else) from the "low"
+            # Contributors group to the "none" Minimal Activity group. The
+            # floor only matters for contributors whose max tier is low or
+            # none; it can never override a high/moderate/regular placement
+            # because any of those already implies activity well above Q1.
+            top = max_tier(merge_tier, pr_tier, review_tier, total_tier)
+            if top in ("high", "moderate", "regular"):
+                group_tier = top
+            elif total_activity > total_lower_floor:
+                group_tier = "low"
+            else:
+                group_tier = "none"
 
             stats = {
                 "merge_tier": merge_tier,
@@ -357,7 +376,8 @@ async def extract_profiles():
                 "review_tier": review_tier,
                 "total_tier": total_tier,
                 "group_tier": group_tier,
-                "total_activity_fence": total_fence,
+                "total_activity_upper_fence": total_upper_fence,
+                "total_activity_lower_floor": total_lower_floor,
                 "commits": data["commits"],
                 "merge_commits": data["merge_commits"],
                 "insertions": data["insertions"],
