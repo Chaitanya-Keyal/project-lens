@@ -246,12 +246,16 @@ async def extract_profiles():
         profiles = merged_profiles
 
         # --- Compute per-dimension tiers using standard deviation bands ---
-        # For each dimension (merges, prs, reviews), compute mean and stdev
+        # For each dimension (merges, prs, reviews, total), compute mean and stdev
         # across non-zero contributors. Then classify each person as:
         #   high:     > mean + 1 stdev  (statistical outliers — dominant in this dimension)
         #   moderate: > mean            (above average)
         #   low:      > 0              (some activity)
         #   none:     0                (no activity in this dimension)
+        # A Tukey upper-outlier fence (Q3 + 1.5*IQR) on total_activity is also
+        # computed to carve a "regular" band out of the low group. Tukey is used
+        # here because total_activity is heavily right-skewed, which makes linear
+        # mean-based lower bounds unusable (mean - stdev goes negative).
         import statistics as _stats
 
         def compute_bands(values: list[int]) -> tuple[float, float]:
@@ -263,6 +267,16 @@ async def extract_profiles():
             stdev = _stats.stdev(nonzero)
             return (mean, mean + stdev)
 
+        def compute_tukey_fence(values: list[int]) -> float:
+            """Upper-outlier fence (Q3 + 1.5*IQR) over non-zero values."""
+            nonzero = sorted(v for v in values if v > 0)
+            n = len(nonzero)
+            if n < 4:
+                return 0.0
+            q1 = nonzero[n // 4]
+            q3 = nonzero[3 * n // 4]
+            return q3 + 1.5 * (q3 - q1)
+
         def classify(value: int, mean: float, high_threshold: float) -> str:
             if value == 0:
                 return "none"
@@ -272,14 +286,41 @@ async def extract_profiles():
                 return "moderate"
             return "low"
 
+        def classify_total(value: int, fence: float, mean: float, high_threshold: float) -> str:
+            """5-valued classifier for the total-activity dimension.
+
+            Adds a "regular" band between "low" and "moderate" using the Tukey
+            upper-outlier fence (Q3 + 1.5*IQR), which is robust to the right-skew
+            that makes linear mean-based lower bounds useless on this kind of
+            distribution. The mean cutoff still takes precedence over the fence
+            — a value above the mean is always "moderate" or higher.
+            """
+            if value == 0:
+                return "none"
+            if value > high_threshold:
+                return "high"
+            if value > mean:
+                return "moderate"
+            if value > fence:
+                return "regular"
+            return "low"
+
+        _TIER_RANK = {"none": 0, "low": 1, "regular": 2, "moderate": 3, "high": 4}
+
+        def max_tier(*tiers: str) -> str:
+            return max(tiers, key=lambda t: _TIER_RANK.get(t, 0))
+
         all_merges = [d["merge_commits"] for d in profiles.values()]
         all_prs = [d["prs_merged"] for d in profiles.values()]
         all_reviews = [d["reviews_given"] + d["review_comments_given"] + d["pr_comments_given"]
                        for d in profiles.values()]
+        all_totals = [m + p + r for m, p, r in zip(all_merges, all_prs, all_reviews)]
 
         merge_mean, merge_high = compute_bands(all_merges)
         pr_mean, pr_high = compute_bands(all_prs)
         review_mean, review_high = compute_bands(all_reviews)
+        total_mean, total_high = compute_bands(all_totals)
+        total_fence = compute_tukey_fence(all_totals)
 
         # --- Build final profiles ---
         now = datetime.now(timezone.utc)
@@ -295,15 +336,28 @@ async def extract_profiles():
             last_active = max(dates) if dates else None
 
             total_review_engagement = data["reviews_given"] + data["review_comments_given"] + data["pr_comments_given"]
+            total_activity = data["merge_commits"] + data["prs_merged"] + total_review_engagement
 
             merge_tier = classify(data["merge_commits"], merge_mean, merge_high)
             pr_tier = classify(data["prs_merged"], pr_mean, pr_high)
             review_tier = classify(total_review_engagement, review_mean, review_high)
+            total_tier = classify_total(total_activity, total_fence, total_mean, total_high)
+
+            # group_tier: the contributor's overall PM grouping, 5-way.
+            # Single-dim specialists qualify because the max propagates any
+            # dimension's tier. The "regular" band lives on total_tier only
+            # (the per-dim tiers are 4-valued); it surfaces as group_tier when
+            # a contributor is low/none across every dimension but their total
+            # activity crosses the Tukey fence.
+            group_tier = max_tier(merge_tier, pr_tier, review_tier, total_tier)
 
             stats = {
                 "merge_tier": merge_tier,
                 "pr_tier": pr_tier,
                 "review_tier": review_tier,
+                "total_tier": total_tier,
+                "group_tier": group_tier,
+                "total_activity_fence": total_fence,
                 "commits": data["commits"],
                 "merge_commits": data["merge_commits"],
                 "insertions": data["insertions"],
@@ -316,6 +370,7 @@ async def extract_profiles():
                 "review_comments_given": data["review_comments_given"],
                 "pr_comments_given": data["pr_comments_given"],
                 "total_review_engagement": total_review_engagement,
+                "total_activity": total_activity,
                 "repos_active": sorted(data["repos_active"]),
             }
 
@@ -469,13 +524,13 @@ async def show_summary():
         profiles = result.scalars().all()
 
         print(f"Contributor Profiles: {len(profiles)}")
-        print(f"{'=' * 80}")
-        print(f"{'Login':<25} {'Names':<20} {'Merges':>6} {'M':>4} {'Shipped':>7} {'P':>4} {'Engagement':>10} {'R':>4}")
-        print(f"{'-' * 90}")
+        print(f"{'=' * 110}")
+        print(f"{'Login':<25} {'Names':<20} {'Merges':>6} {'M':>4} {'Shipped':>7} {'P':>4} {'Engagement':>10} {'R':>4} {'Total':>6} {'T':>4} {'Group':>9}")
+        print(f"{'-' * 110}")
 
         sorted_profiles = sorted(
             profiles,
-            key=lambda p: -(p.stats.get("merge_commits", 0) + p.stats.get("prs_merged", 0) + p.stats.get("total_review_engagement", 0)),
+            key=lambda p: -p.stats.get("total_activity", p.stats.get("merge_commits", 0) + p.stats.get("prs_merged", 0) + p.stats.get("total_review_engagement", 0)),
         )
 
         for p in sorted_profiles:
@@ -483,15 +538,18 @@ async def show_summary():
             merges = s.get("merge_commits", 0)
             shipped = s.get("prs_merged", 0)
             engagement = s.get("total_review_engagement", 0)
-            if merges + shipped + engagement == 0:
+            total = s.get("total_activity", merges + shipped + engagement)
+            if total == 0:
                 continue
 
             mt = s.get("merge_tier", "none")
             pt = s.get("pr_tier", "none")
             rt = s.get("review_tier", "none")
+            tt = s.get("total_tier", "none")
+            gt = s.get("group_tier", "none")
             names = ", ".join(n for n in p.display_names if n != p.github_login)[:18]
 
-            print(f"{p.github_login:<25} {names:<20} {merges:>6} {mt:>4} {shipped:>7} {pt:>4} {engagement:>10} {rt:>4}")
+            print(f"{p.github_login:<25} {names:<20} {merges:>6} {mt:>4} {shipped:>7} {pt:>4} {engagement:>10} {rt:>4} {total:>6} {tt:>4} {gt:>9}")
 
 
 async def has_new_data() -> bool:

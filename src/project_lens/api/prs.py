@@ -80,6 +80,9 @@ class ContributorActivity:
     merge_tier: str = "none"
     pr_tier: str = "none"
     review_tier: str = "none"
+    total_tier: str = "none"
+    group_tier: str = "none"
+    total_activity: int = 0
 
 
 class PRService:
@@ -305,6 +308,14 @@ class PRService:
                     merge_tier=p.stats.get("merge_tier", "none"),
                     pr_tier=p.stats.get("pr_tier", "none"),
                     review_tier=p.stats.get("review_tier", "none"),
+                    total_tier=p.stats.get("total_tier", "none"),
+                    group_tier=p.stats.get("group_tier", "none"),
+                    total_activity=p.stats.get(
+                        "total_activity",
+                        p.stats.get("merge_commits", 0)
+                        + p.stats.get("prs_merged", 0)
+                        + p.stats.get("total_review_engagement", 0),
+                    ),
                 )
                 for p in result.scalars()
             ]
