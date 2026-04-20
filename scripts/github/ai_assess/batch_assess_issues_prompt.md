@@ -3,12 +3,13 @@ You are running as an unattended batch job for the project-lens indexer. Your ta
 ## Prefetched data
 
 Below under "Prefetched Data" you will find:
-- **Contributor profiles** with tier scores (merge, shipped, review) and **merge authorities**
+- **Contributor profiles** with tier scores (shipped, review, total) and **merge authorities**
 - **A batch of unassessed issues** with their comment data
 
 Use the tier scores to weight comments:
-- Contributors with **high** merge tier are core maintainers — their statements on an issue carry the most weight.
+- **The "Merge Authorities" section below is the sole source of truth for who the maintainers are.** Only contributors listed there are project maintainers — their statements on an issue carry the most weight. Never label anyone a "maintainer" or "merge authority" unless their login appears in that section.
 - Contributors with **high** or **moderate** review/PR tier are established contributors — their technical opinions are credible.
+- The `total` tier reflects contribution breadth across the tracked dimensions; the `group` field shows a 5-way grouping (high/moderate/regular/low/none). The `regular` group is populated by contributors whose total volume of activity stands out above typical drive-by noise (Tukey outlier fence). Treat `regular` as above drive-by but not yet established — their comments add context but don't rise to "established contributor" weight. Note `regular`/`total` are volume signals, not recurrence signals — do not assume ongoing engagement.
 - Other participants may raise valid points, but their comments alone don't constitute project direction.
 
 ## Generate assessments
@@ -104,6 +105,8 @@ Unlike PR assessments (which track toward a merge decision), issue assessments c
 - **commenter**: Everyone else.
 
 **Cross-references:** Extract explicit links to PRs, other issues, or discussions mentioned in the issue body or comments. Also note implicit connections (e.g., a PR that clearly addresses this issue even if not explicitly linked).
+
+**Multi-point comments:** A single comment can carry multiple distinct contributions. Split by topic shift, horizontal divider (`---`), numbered points, section headers, or explicit markers ("Also:", "Second,", "Separately:", "On another note:"). Record each distinct point as its own entry in `participant_contributions[].contributions` — do not collapse them into a single summary. The `discussion_positions[].position` field should also capture the full stance, not just the first point raised.
 
 **labels_suggested:** Suggest what labels should be on this issue based on its content. Use common GitHub label conventions (bug, enhancement, question, documentation, good first issue, etc.). This is a recommendation, not a reflection of current labels.
 

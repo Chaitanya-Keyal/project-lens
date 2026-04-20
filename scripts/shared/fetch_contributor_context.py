@@ -36,22 +36,23 @@ async def get_contributor_context(
         lines.append("=== Contributor Profiles ===")
         for p in result.scalars():
             s_ = p.stats
-            total = s_.get('merge_commits', 0) + s_.get('prs_merged', 0) + s_.get('total_review_engagement', 0)
+            total = s_.get('total_activity', s_.get('merge_commits', 0) + s_.get('prs_merged', 0) + s_.get('total_review_engagement', 0))
             if total < 5:
                 continue
-            mt = s_.get('merge_tier', 'none')
             pt = s_.get('pr_tier', 'none')
             rt = s_.get('review_tier', 'none')
+            tt = s_.get('total_tier', 'none')
+            gt = s_.get('group_tier', 'none')
             login_str = p.github_login
             if include_telegram_senders and p.display_names:
                 names = ', '.join(n for n in p.display_names if n != p.github_login)
                 if names:
                     login_str += f" (names: {names})"
             lines.append(
-                f"{login_str} — merges:{mt} shipped:{pt} reviews:{rt}"
-                f" — {s_.get('merge_commits', 0)} merges,"
-                f" {s_.get('prs_merged', 0)} PRs merged,"
-                f" {s_.get('total_review_engagement', 0)} review engagements"
+                f"{login_str} — shipped:{pt} reviews:{rt} total:{tt} group:{gt}"
+                f" — {s_.get('prs_merged', 0)} PRs merged,"
+                f" {s_.get('total_review_engagement', 0)} review engagements,"
+                f" {total} total"
             )
 
         if include_merge_authorities:
