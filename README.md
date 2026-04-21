@@ -221,13 +221,16 @@ python scripts/embed_digests.py
 
 **Steps 1-3** are fast and free — just git operations, GitHub API calls, and local computation. Step 2 is rate-limited by the GitHub API but only needs a full fetch once; after that, it incrementally fetches only PRs with new activity.
 
-**Step 3** (contributor extraction) must run after steps 1 and 2 because it derives profiles from both git history and GitHub PR data. It resolves contributor identities across systems (git author names/emails → GitHub logins), then scores each contributor across three independent dimensions using statistical bands:
+**Step 3** (contributor extraction) must run after steps 1 and 2 because it derives profiles from both git history and GitHub PR data. It resolves contributor identities across systems (git author names/emails → GitHub logins), then scores each contributor across four volume-based dimensions using statistical bands:
 
-- **Merge authority** — who merges other people's PRs (merge commits)
-- **Shipped code** — whose authored PRs get accepted and merged
-- **Review engagement** — total PR interaction (formal reviews + inline code comments + discussion comments)
+- **Merge commits** — merge commits this contributor authored in git history
+- **Shipped code** — PRs this contributor filed that landed
+- **Review engagement** — PR interaction on others' PRs (formal reviews + inline code comments + discussion comments)
+- **Total activity** — the sum of the three above
 
-Each dimension is scored as high/moderate/low/none based on the project's own distribution (mean + 1 standard deviation thresholds). This produces contributor profiles that downstream AI steps (PR assessments, Telegram digestion) use to understand who the key people are and what roles they play — without any manual configuration.
+Per-dimension scores use linear mean+stdev bands (high / moderate / low / none). The total dimension adds two further order-statistic cutoffs: a Tukey upper fence (`Q3 + 1.5·IQR`) that defines a "regular" band between low and moderate, and a Q1 lower floor below which single-action drive-bys fall into "none." The resulting per-contributor `group_tier` — a five-way high / moderate / regular / low / none classification derived from the max across all four dimensions with the fence/floor applied to total activity — is what downstream consumers use to render contributor groupings. See [`docs/knowledge/contributor-tier-classification-methodology.md`](docs/knowledge/contributor-tier-classification-methodology.md) for the statistical rationale.
+
+The merge-commits dimension is a descriptive historical signal (who authored merge commits in the git log), not a signal of current merge authorization. Current merge authority is defined only by the `merge_authorities` config block. See [`docs/knowledge/merge-authority-vs-merge-tier.md`](docs/knowledge/merge-authority-vs-merge-tier.md) for details.
 
 **Steps 4-5** are the AI analysis passes — they read stored PR and issue data from the database, generate structured assessments, and write them back. Each item is committed individually, so progress is never lost. Issue assessments follow a different schema than PR assessments, tuned for the reality that issue discussions often don't reach conclusions — the AI honestly characterizes stale discussions, notes when nobody with authority weighed in, and avoids imposing a narrative of progress where none exists.
 
@@ -284,7 +287,7 @@ Project Lens uses two SQLite databases. The main database holds GitHub data, ass
 - **git_commits** — full commit history from local clones (authors, file changes, insertions/deletions)
 - **github_prs** — PR metadata, bodies, review comments, issue comments (complete API data as JSON)
 - **github_issues** — issue metadata, bodies, and comment threads (complete API data as JSON, open and closed)
-- **contributor_profiles** — data-derived profiles per contributor: GitHub login, display names seen across systems, activity stats, and per-dimension tier scores (merge authority, shipped code, review engagement)
+- **contributor_profiles** — data-derived profiles per contributor: GitHub login, display names seen across systems, activity stats, per-dimension tier scores (merge commits, shipped code, review engagement, total activity), and the derived five-way `group_tier` (high / moderate / regular / low / none)
 - **pr_assessments** — AI-generated analysis per PR: tier, complexity, risk, narrative summary, per-participant contributions, lessons learned, outcome assessment, cross-references to related PRs/issues, test coverage evolution from initial submission to merge. For open PRs: per-person pending actions (what's on each participant's plate), merge readiness classification (not_ready/possibly_ready/merge_ready), per-reviewer sentiment, and staleness detection.
 - **issue_assessments** — AI-generated analysis per issue: tier, category (bug/feature_request/question/discussion/task/support), complexity, impact, narrative summary, discussion state (active/stale/resolved/wont_fix/duplicate), stale reason when applicable, per-participant contributions, discussion positions capturing each participant's stance, cross-references to related PRs and issues, and suggested labels. Designed for the reality that issue discussions often don't reach conclusions — honestly characterizes when discussions fizzled out or went nowhere.
 - **ai_digests** — cached AI outputs with content hashes, so unchanged data is never re-analyzed. Includes PR assessment digests, issue assessment digests, and Telegram thread summaries.
@@ -354,10 +357,6 @@ python scripts/link_name.py --list
 python scripts/github/ai_assess/reassess_open_prs.py --dry-run
 python scripts/github/ai_assess/reassess_open_prs.py
 ```
-
-## Planned
-
-- **Translation completeness tracking** — parse `.po` files to track per-language translation progress over time, with both string-based and word-weighted completion metrics.
 
 ## License
 
