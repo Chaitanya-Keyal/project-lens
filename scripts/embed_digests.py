@@ -29,7 +29,7 @@ from project_lens.settings import settings
 from project_lens.database import async_session
 from sqlalchemy import and_
 
-from project_lens.models import AIDigest, GithubPR, PRAssessment, IssueAssessment
+from project_lens.models import AIDigest, GithubIssue, GithubPR, PRAssessment, IssueAssessment
 
 
 # ---------------------------------------------------------------------------
@@ -131,7 +131,7 @@ async def fetch_pr_assessment_texts() -> list[dict]:
     """
     async with async_session() as session:
         result = await session.execute(
-            select(PRAssessment, GithubPR.state)
+            select(PRAssessment, GithubPR.state, GithubPR.title)
             .outerjoin(
                 GithubPR,
                 and_(
@@ -144,11 +144,15 @@ async def fetch_pr_assessment_texts() -> list[dict]:
         rows = result.all()
 
         texts = []
-        for a, github_state in rows:
+        for a, github_state, title in rows:
             parts = [
                 f"PR #{a.pr_number} ({a.repo})",
-                f"Tier: {a.tier}, Complexity: {a.complexity}, Risk: {a.risk}",
             ]
+            if title:
+                parts.append(f"Title: {title}")
+            parts.append(
+                f"Tier: {a.tier}, Complexity: {a.complexity}, Risk: {a.risk}"
+            )
             if a.summary:
                 parts.append(a.summary)
             if a.recommendation:
@@ -187,17 +191,29 @@ async def fetch_issue_assessment_texts() -> list[dict]:
     """
     async with async_session() as session:
         result = await session.execute(
-            select(IssueAssessment).order_by(IssueAssessment.repo, IssueAssessment.issue_number)
+            select(IssueAssessment, GithubIssue.title)
+            .outerjoin(
+                GithubIssue,
+                and_(
+                    IssueAssessment.repo == GithubIssue.repo,
+                    IssueAssessment.issue_number == GithubIssue.number,
+                ),
+            )
+            .order_by(IssueAssessment.repo, IssueAssessment.issue_number)
         )
-        assessments = result.scalars().all()
+        rows = result.all()
 
         texts = []
-        for a in assessments:
+        for a, title in rows:
             parts = [
                 f"Issue #{a.issue_number} ({a.repo})",
-                f"Tier: {a.tier}, Category: {a.category}, Complexity: {a.complexity}, Impact: {a.impact}",
-                f"State: {a.discussion_state}",
             ]
+            if title:
+                parts.append(f"Title: {title}")
+            parts.append(
+                f"Tier: {a.tier}, Category: {a.category}, Complexity: {a.complexity}, Impact: {a.impact}"
+            )
+            parts.append(f"State: {a.discussion_state}")
             if a.summary:
                 parts.append(a.summary)
             if a.recommendation:
