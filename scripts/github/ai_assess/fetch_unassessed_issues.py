@@ -71,10 +71,10 @@ async def main():
         print(f"Created: {str(issue.created_at_gh)[:10]}")
         if issue.closed_at_gh:
             print(f"Closed: {str(issue.closed_at_gh)[:10]}")
-        print(f"Body: {(issue.body or '')[:500]}")
+        print(f"Body: {(issue.body or '')[:2000]}")
         print(f"Comments ({len(comments)}):")
         for c in comments:
-            print(f"  [{c.get('created_at', '?')[:10]}] {c['user']['login']} ({c.get('author_association', '?')}): {(c.get('body') or '')[:300]}")
+            print(f"  [{c.get('created_at', '?')[:10]}] {c['user']['login']} ({c.get('author_association', '?')}): {(c.get('body') or '')[:2000]}")
         print()
 
 

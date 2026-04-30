@@ -74,16 +74,16 @@ async def main():
             print(f"Merged: {str(pr.merged_at_gh)[:10]}")
         if pr.closed_at_gh and not pr.merged_at_gh:
             print(f"Closed: {str(pr.closed_at_gh)[:10]}")
-        print(f"Body: {(pr.body or '')[:400]}")
+        print(f"Body: {(pr.body or '')[:2000]}")
         print(f"Reviews ({len(reviews)}):")
         for r in reviews:
-            print(f"  [{r.get('submitted_at', '?')[:10]}] {r['user']['login']}: {r['state']} - {(r.get('body') or '')[:200]}")
+            print(f"  [{r.get('submitted_at', '?')[:10]}] {r['user']['login']}: {r['state']} - {(r.get('body') or '')[:2000]}")
         print(f"Review comments ({len(review_comments)}):")
         for c in review_comments:
-            print(f"  [{c.get('created_at', '?')[:10]}] {c['user']['login']}: {(c.get('body') or '')[:200]}")
+            print(f"  [{c.get('created_at', '?')[:10]}] {c['user']['login']}: {(c.get('body') or '')[:2000]}")
         print(f"Issue comments ({len(issue_comments)}):")
         for c in issue_comments:
-            print(f"  [{c.get('created_at', '?')[:10]}] {c['user']['login']}: {(c.get('body') or '')[:200]}")
+            print(f"  [{c.get('created_at', '?')[:10]}] {c['user']['login']}: {(c.get('body') or '')[:2000]}")
         print()
 
 
