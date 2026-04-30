@@ -7,6 +7,40 @@ from sqlalchemy import and_, or_, select
 
 from project_lens.models import GithubIssue, IssueAssessment
 from project_lens.api.config import LensConfig
+from project_lens.api.prs import _compute_last_actor
+
+
+def _to_issue_with_assessment(issue, a) -> "IssueWithAssessment":
+    """Build an ``IssueWithAssessment`` from a (GithubIssue, IssueAssessment | None) row."""
+    return IssueWithAssessment(
+        repo=issue.repo,
+        number=issue.number,
+        title=issue.title,
+        author=issue.author,
+        state=issue.state,
+        labels=issue.labels,
+        comment_count=issue.comment_count,
+        created_at=issue.created_at_gh,
+        updated_at=issue.updated_at_gh,
+        closed_at=issue.closed_at_gh,
+        tier=a.tier if a else None,
+        category=a.category if a else None,
+        complexity=a.complexity if a else None,
+        impact=a.impact if a else None,
+        summary=a.summary if a else None,
+        recommendation=a.recommendation if a else None,
+        discussion_state=a.discussion_state if a else None,
+        stale_reason=a.stale_reason if a else None,
+        participant_contributions=a.participant_contributions if a else None,
+        last_actor=_compute_last_actor(
+            issue.author,
+            issue.created_at_gh,
+            None,
+            None,
+            issue.comments_json,
+            open_action="opened issue",
+        ),
+    )
 
 
 @dataclass
@@ -32,6 +66,8 @@ class IssueWithAssessment:
     discussion_state: str | None
     stale_reason: str | None
     participant_contributions: list | None
+    # Most recent action: {"username", "at": datetime, "action": str}
+    last_actor: dict | None = None
 
 
 @dataclass
@@ -90,30 +126,7 @@ class IssueService:
                     GithubIssue.updated_at_gh.desc(),
                 )
             )
-            return [
-                IssueWithAssessment(
-                    repo=issue.repo,
-                    number=issue.number,
-                    title=issue.title,
-                    author=issue.author,
-                    state=issue.state,
-                    labels=issue.labels,
-                    comment_count=issue.comment_count,
-                    created_at=issue.created_at_gh,
-                    updated_at=issue.updated_at_gh,
-                    closed_at=issue.closed_at_gh,
-                    tier=a.tier if a else None,
-                    category=a.category if a else None,
-                    complexity=a.complexity if a else None,
-                    impact=a.impact if a else None,
-                    summary=a.summary if a else None,
-                    recommendation=a.recommendation if a else None,
-                    discussion_state=a.discussion_state if a else None,
-                    stale_reason=a.stale_reason if a else None,
-                    participant_contributions=a.participant_contributions if a else None,
-                )
-                for issue, a in result.all()
-            ]
+            return [_to_issue_with_assessment(issue, a) for issue, a in result.all()]
 
     async def get_issue_detail(self, repo: str, number: int) -> IssueDetail | None:
         """Full issue detail with all assessment fields and raw comment data."""
@@ -160,6 +173,33 @@ class IssueService:
                 labels_suggested=a.labels_suggested if a else None,
                 comments=issue.comments_json or [],
             )
+
+    async def get_issues_by_keys(
+        self, keys: list[tuple[str, int]],
+    ) -> dict[tuple[str, int], IssueWithAssessment]:
+        """Batch lookup of full issue + assessment data by (repo, number)."""
+        if not keys:
+            return {}
+        async with self._config.async_session() as session:
+            conditions = [
+                and_(GithubIssue.repo == repo, GithubIssue.number == number)
+                for repo, number in keys
+            ]
+            result = await session.execute(
+                select(GithubIssue, IssueAssessment)
+                .outerjoin(
+                    IssueAssessment,
+                    and_(
+                        GithubIssue.repo == IssueAssessment.repo,
+                        GithubIssue.number == IssueAssessment.issue_number,
+                    ),
+                )
+                .where(or_(*conditions))
+            )
+            return {
+                (issue.repo, issue.number): _to_issue_with_assessment(issue, a)
+                for issue, a in result.all()
+            }
 
     async def get_issue_titles(
         self, keys: list[tuple[str, int]],

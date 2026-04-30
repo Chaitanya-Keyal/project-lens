@@ -1,12 +1,108 @@
 """PR and assessment data queries."""
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 
 from sqlalchemy import and_, func, or_, select
 
 from project_lens.models import ContributorProfile, GithubPR, PRAssessment
 from project_lens.api.config import LensConfig
+
+
+def _parse_iso(value) -> datetime | None:
+    """Parse a GitHub ISO8601 timestamp or datetime; returns tz-aware UTC."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        try:
+            dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _compute_last_actor(
+    author: str | None,
+    created_at: datetime | None,
+    reviews: list | None,
+    review_comments: list | None,
+    issue_comments: list | None,
+    open_action: str = "opened PR",
+) -> dict | None:
+    """Pick the most recent (timestamp, username, action) across PR events.
+
+    Considers the PR opening, reviews (submitted_at), review comments and
+    issue comments (created_at). Returns dict with ``username``, ``at``, ``action``.
+    """
+    candidates: list[tuple[datetime, str, str]] = []
+
+    opened_at = _parse_iso(created_at)
+    if opened_at and author:
+        candidates.append((opened_at, author, open_action))
+
+    for r in reviews or []:
+        if not isinstance(r, dict):
+            continue
+        user = (r.get("user") or {}).get("login")
+        ts = _parse_iso(r.get("submitted_at"))
+        if user and ts:
+            candidates.append((ts, user, "reviewed"))
+
+    for c in review_comments or []:
+        if not isinstance(c, dict):
+            continue
+        user = (c.get("user") or {}).get("login")
+        ts = _parse_iso(c.get("created_at"))
+        if user and ts:
+            candidates.append((ts, user, "commented on code"))
+
+    for c in issue_comments or []:
+        if not isinstance(c, dict):
+            continue
+        user = (c.get("user") or {}).get("login")
+        ts = _parse_iso(c.get("created_at"))
+        if user and ts:
+            candidates.append((ts, user, "commented"))
+
+    if not candidates:
+        return None
+    ts, username, action = max(candidates, key=lambda x: x[0])
+    return {"username": username, "at": ts, "action": action}
+
+
+def _to_pr_with_assessment(pr, a) -> "PRWithAssessment":
+    """Build a ``PRWithAssessment`` from a (GithubPR, PRAssessment | None) row."""
+    return PRWithAssessment(
+        repo=pr.repo,
+        number=pr.number,
+        title=pr.title,
+        author=pr.author,
+        state=pr.state,
+        review_state=pr.review_state,
+        created_at=pr.created_at_gh,
+        updated_at=pr.updated_at_gh,
+        tier=a.tier if a else None,
+        complexity=a.complexity if a else None,
+        risk=a.risk if a else None,
+        summary=a.summary if a else None,
+        recommendation=a.recommendation if a else None,
+        participant_contributions=a.participant_contributions if a else None,
+        outcome=a.outcome if a else None,
+        pending_actions=a.pending_actions if a else None,
+        merged_at=pr.merged_at_gh,
+        closed_at=pr.closed_at_gh,
+        last_actor=_compute_last_actor(
+            pr.author,
+            pr.created_at_gh,
+            pr.reviews_json,
+            pr.review_comments_json,
+            pr.issue_comments_json,
+        ),
+    )
 
 
 @dataclass
@@ -30,6 +126,8 @@ class PRWithAssessment:
     pending_actions: dict | None
     merged_at: datetime | None = None
     closed_at: datetime | None = None
+    # Most recent action: {"username", "at": datetime, "action": str}
+    last_actor: dict | None = None
 
 
 @dataclass
@@ -65,6 +163,8 @@ class PRDetail:
     raw_reviews: list = field(default_factory=list)
     raw_review_comments: list = field(default_factory=list)
     raw_issue_comments: list = field(default_factory=list)
+    # Most recent action: {"username", "at": datetime, "action": str}
+    last_actor: dict | None = None
 
 
 @dataclass
@@ -109,27 +209,7 @@ class PRService:
                     GithubPR.updated_at_gh.desc(),
                 )
             )
-            return [
-                PRWithAssessment(
-                    repo=pr.repo,
-                    number=pr.number,
-                    title=pr.title,
-                    author=pr.author,
-                    state=pr.state,
-                    review_state=pr.review_state,
-                    created_at=pr.created_at_gh,
-                    updated_at=pr.updated_at_gh,
-                    tier=a.tier if a else None,
-                    complexity=a.complexity if a else None,
-                    risk=a.risk if a else None,
-                    summary=a.summary if a else None,
-                    recommendation=a.recommendation if a else None,
-                    participant_contributions=a.participant_contributions if a else None,
-                    outcome=a.outcome if a else None,
-                    pending_actions=a.pending_actions if a else None,
-                )
-                for pr, a in result.all()
-            ]
+            return [_to_pr_with_assessment(pr, a) for pr, a in result.all()]
 
     async def get_recently_closed_prs(
         self, since: datetime | None = None,
@@ -153,29 +233,7 @@ class PRService:
                 .where(*filters)
                 .order_by(event_ts.desc())
             )
-            return [
-                PRWithAssessment(
-                    repo=pr.repo,
-                    number=pr.number,
-                    title=pr.title,
-                    author=pr.author,
-                    state=pr.state,
-                    review_state=pr.review_state,
-                    created_at=pr.created_at_gh,
-                    updated_at=pr.updated_at_gh,
-                    tier=a.tier if a else None,
-                    complexity=a.complexity if a else None,
-                    risk=a.risk if a else None,
-                    summary=a.summary if a else None,
-                    recommendation=a.recommendation if a else None,
-                    participant_contributions=a.participant_contributions if a else None,
-                    outcome=a.outcome if a else None,
-                    pending_actions=a.pending_actions if a else None,
-                    merged_at=pr.merged_at_gh,
-                    closed_at=pr.closed_at_gh,
-                )
-                for pr, a in result.all()
-            ]
+            return [_to_pr_with_assessment(pr, a) for pr, a in result.all()]
 
     async def get_pr_detail(self, repo: str, number: int) -> PRDetail | None:
         """Full PR detail with all assessment fields and raw GitHub data."""
@@ -224,6 +282,13 @@ class PRService:
                 raw_reviews=pr.reviews_json or [],
                 raw_review_comments=pr.review_comments_json or [],
                 raw_issue_comments=pr.issue_comments_json or [],
+                last_actor=_compute_last_actor(
+                    pr.author,
+                    pr.created_at_gh,
+                    pr.reviews_json,
+                    pr.review_comments_json,
+                    pr.issue_comments_json,
+                ),
             )
 
     async def get_pr_titles(
@@ -285,6 +350,37 @@ class PRService:
                             usernames.add(un.lower())
                 participants[(repo, number)] = usernames
             return participants
+
+    async def get_prs_by_keys(
+        self, keys: list[tuple[str, int]],
+    ) -> dict[tuple[str, int], PRWithAssessment]:
+        """Batch lookup of full PR + assessment data by (repo, number).
+
+        Returned objects match the shape from ``get_open_prs_with_assessments``
+        (including ``last_actor``). Missing PRs are simply absent from the dict.
+        """
+        if not keys:
+            return {}
+        async with self._config.async_session() as session:
+            conditions = [
+                and_(GithubPR.repo == repo, GithubPR.number == number)
+                for repo, number in keys
+            ]
+            result = await session.execute(
+                select(GithubPR, PRAssessment)
+                .outerjoin(
+                    PRAssessment,
+                    and_(
+                        GithubPR.repo == PRAssessment.repo,
+                        GithubPR.number == PRAssessment.pr_number,
+                    ),
+                )
+                .where(or_(*conditions))
+            )
+            return {
+                (pr.repo, pr.number): _to_pr_with_assessment(pr, a)
+                for pr, a in result.all()
+            }
 
     async def discover_contributors(self) -> list[ContributorActivity]:
         """All contributors with activity stats, ordered by last active."""

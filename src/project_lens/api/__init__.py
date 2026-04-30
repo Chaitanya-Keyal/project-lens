@@ -136,6 +136,18 @@ class LensClient:
         """Batch lookup of participant usernames (author + contributors) by (repo, number) pairs."""
         return await self._prs.get_pr_participants(keys)
 
+    async def get_prs_by_keys(
+        self, keys: list[tuple[str, int]],
+    ) -> dict[tuple[str, int], PRWithAssessment]:
+        """Batch lookup of full PR + assessment data by (repo, number)."""
+        return await self._prs.get_prs_by_keys(keys)
+
+    async def get_issues_by_keys(
+        self, keys: list[tuple[str, int]],
+    ) -> dict[tuple[str, int], IssueWithAssessment]:
+        """Batch lookup of full issue + assessment data by (repo, number)."""
+        return await self._issues.get_issues_by_keys(keys)
+
     async def discover_contributors(self) -> list[ContributorActivity]:
         """All contributors with activity stats."""
         return await self._prs.discover_contributors()
