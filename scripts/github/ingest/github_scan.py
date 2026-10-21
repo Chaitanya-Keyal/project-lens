@@ -55,7 +55,7 @@ def parse_gh_datetime(s: str | None) -> datetime | None:
 # GraphQL query templates
 # ---------------------------------------------------------------------------
 
-# Fragment for rateLimit — included in every query
+# Fragment for rateLimit, included in every query
 RATE_LIMIT_FRAGMENT = "rateLimit { cost remaining resetAt }"
 
 PR_SEARCH_QUERY = """
@@ -262,7 +262,7 @@ async def graphql_query(client: httpx.AsyncClient, limiter: RateLimiter, query: 
     resp = await client.post(GRAPHQL_URL, json={"query": query, "variables": variables}, headers=HEADERS)
 
     if resp.status_code == 403:
-        print(f"    403 response — backing off 60s...")
+        print(f"    403 response, backing off 60s...")
         await asyncio.sleep(60)
         resp = await client.post(GRAPHQL_URL, json={"query": query, "variables": variables}, headers=HEADERS)
 
@@ -496,7 +496,7 @@ async def paginate_pr_nested(client: httpx.AsyncClient, limiter: RateLimiter,
         if thread_comments_pi.get("hasNextPage"):
             # Rare: a single review thread with >20 comments.
             # We'd need the thread ID to paginate, which we don't have in the current
-            # query. Log it and accept the truncation — this is extremely uncommon.
+            # query. Log it and accept the truncation; this is extremely uncommon.
             print(f"      PR #{pr_number}: review thread has >20 comments (truncated)")
 
     # Paginate to get more review threads if the connection was truncated
@@ -789,13 +789,15 @@ async def main():
                 print(f"  Error: {e}")
                 stats.append({"repo": repo.full_name, "error": str(e)})
 
+    errors = [s for s in stats if "error" in s]
+
     # Record the analysis run
     async with async_session() as session:
         run = AnalysisRun(
             run_type="github_scan",
             started_at=run_start,
             completed_at=datetime.now(timezone.utc),
-            status="completed",
+            status="completed_with_errors" if errors else "completed",
             summary=str(stats),
         )
         session.add(run)
@@ -805,6 +807,14 @@ async def main():
     print(f"\nDone in {elapsed}. {limiter.total_requests} GraphQL queries, {limiter.total_points} points used.")
     for s in stats:
         print(f"  {s}")
+
+    # Fail loudly: exiting nonzero stops the pipeline (set -e) before it logs "complete",
+    # and the ERROR line is what the cron dashboard flags (it only reads lines that start
+    # with a timestamp). Swallowed per-repo errors once hid an expired token for 25 days.
+    if errors:
+        stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        print(f"{stamp} ERROR: GitHub scan failed for {len(errors)} of {len(stats)} repo(s)")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

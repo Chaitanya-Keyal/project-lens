@@ -3,7 +3,7 @@
 #
 # Runs the full GitHub ingestion and assessment pipeline in order.
 # Uses set -e: if any step fails, the pipeline stops immediately.
-# Downstream steps depend on upstream data — running assessments on
+# Downstream steps depend on upstream data: running assessments on
 # incomplete data would be worse than skipping them.
 #
 # Usage: ./scripts/pipelines/github-pipeline.sh /path/to/config-repo
@@ -33,7 +33,7 @@ fi
 
 export PROJECT_CONFIG_DIR="$CONFIG_DIR"
 
-# Cron has a minimal PATH — ensure claude and python are reachable
+# Cron has a minimal PATH; ensure claude and python are reachable
 export PATH="$HOME/.local/bin:$PATH"
 
 cd "$(dirname "$0")/../.."
@@ -46,27 +46,32 @@ mkdir -p "$LOG_DIR"
 # All output goes to the log file
 exec >> "$LOG_FILE" 2>&1
 
+# When a step fails, set -e stops the pipeline before it logs "complete". Log a
+# timestamped ERROR line too: the cron dashboard only reads lines that start with a
+# timestamp, so without it the previous run's "complete" would still read as success.
+trap 'rc=$?; echo "$(date "+%Y-%m-%d %H:%M:%S") ERROR: GitHub pipeline failed (exit $rc)"' ERR
+
 echo ""
 echo "=============================="
 echo "$(date): GitHub pipeline starting ($CONFIG_DIR)"
 echo "=============================="
 
-echo "$(date): Step 1 — Indexing git history"
+echo "$(date): Step 1: Indexing git history"
 python scripts/github/ingest/index_git_history.py
 
-echo "$(date): Step 2 — Scanning GitHub PRs, issues, reviews"
+echo "$(date): Step 2: Scanning GitHub PRs, issues, reviews"
 python scripts/github/ingest/github_scan.py
 
-echo "$(date): Step 3 — Extracting contributor profiles"
+echo "$(date): Step 3: Extracting contributor profiles"
 python scripts/github/process/extract_contributors.py
 
-echo "$(date): Step 4 — Assessing new PRs"
+echo "$(date): Step 4: Assessing new PRs"
 ./scripts/github/ai_assess/batch_assess.sh
 
-echo "$(date): Step 5 — Assessing new issues"
+echo "$(date): Step 5: Assessing new issues"
 ./scripts/github/ai_assess/batch_assess_issues.sh
 
-echo "$(date): Step 6 — Updating embeddings"
+echo "$(date): Step 6: Updating embeddings"
 python scripts/embed_digests.py
 
 echo "$(date): GitHub pipeline complete"
